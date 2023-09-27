@@ -217,20 +217,18 @@ class Chunk_memory_update(torch.autograd.Function):
 
         
         
-
     
-    
-
 
 def torch_chunk_parallel_onc(
     key, value,
     g_key, g_value, 
-    query, chunk_size=8, use_triton=True, use_cuda=True  
+    query, chunk_size=16, use_triton=True, use_cuda=True  
 ) -> torch.Tensor:
     '''
     query, query: bf16
     '''
     B, H, L, D_h = query.shape    
+    assert chunk_size == 16
 
     assert L % chunk_size == 0        
     num_block = L // chunk_size
