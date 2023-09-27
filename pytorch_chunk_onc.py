@@ -3,6 +3,8 @@ import torch
 from einops import rearrange
 import triton 
 import triton.language as tl
+from cuda import cuda_compute_intra
+
 
 
 
@@ -223,7 +225,7 @@ class Chunk_memory_update(torch.autograd.Function):
 def torch_chunk_parallel_onc(
     key, value,
     g_key, g_value, 
-    query, chunk_size=8, use_triton=True 
+    query, chunk_size=8, use_triton=True, use_cuda=True  
 ) -> torch.Tensor:
     '''
     query, query: bf16
@@ -260,11 +262,15 @@ def torch_chunk_parallel_onc(
 
     inter_chunk_contribution = compute_inter(query,  decay_key,  memory_cache, decay_value)
     
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, device=query.device, dtype=torch.bool), diagonal=1)
-    inner_chunk_contribution = compute_inner(query, key, value, decay_key, decay_value, mask) 
-    output = inter_chunk_contribution + inner_chunk_contribution
+    if not use_cuda:
+        mask = torch.triu(torch.ones(chunk_size, chunk_size, device=query.device, dtype=torch.bool), diagonal=1)
+        inner_chunk_contribution = compute_inner(query, key, value, decay_key, decay_value, mask) 
+    else:
+        inner_chunk_contribution, _ = cuda_compute_intra(query, key, value, g_key_cumsum, g_value_cumsum)
     
+    output = inter_chunk_contribution + inner_chunk_contribution    
     return rearrange(output, 'b h n c d -> b h (n c) d')
+
 
 
 def torch_recurrent_on(v1, v2, g1, g2, q):
