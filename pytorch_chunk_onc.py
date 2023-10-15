@@ -4,6 +4,7 @@ from einops import rearrange
 import triton 
 import triton.language as tl
 from cuda import cuda_compute_intra
+import torch.nn.functional as F
 
 
 
@@ -25,7 +26,7 @@ def compute_inner(query, key, value, decay_key, decay_value, mask):
 
 @torch.jit.script
 def compute_inter(query,  decay_key,  memory_cache, decay_value):
-    return ((query * decay_key) @ memory_cache) * decay_value    
+    return ((query * decay_key.exp()) @ memory_cache) * decay_value.exp()    
 
 
 @triton.jit
@@ -156,17 +157,13 @@ class Chunk_memory_update(torch.autograd.Function):
         
         return output
 
-
-
-
     @staticmethod
     def backward(ctx, DO):
         DO = DO.contiguous()
 
-        output, decay_key_last, decay_value_last = ctx.saved_tensors
+        output, decay_key_last, decay_value_last = ctx.saved_tensors 
 
         B, H, N, D, D = output.shape 
-
 
         Dacc1 = torch.zeros(B, H, D, D).to(output)
         num_block = N
@@ -215,10 +212,23 @@ class Chunk_memory_update(torch.autograd.Function):
         
             
 
-        
+@torch.jit.script
+def prepare_to_add(g_key, g_value, key, value):
+    g_key = F.logsigmoid(g_key)
+    g_key_cumsum = g_key.cumsum(-2)
+    reduce_chunk_key = (g_key_cumsum[..., -1, None, :] -  g_key_cumsum).exp()
+    g_key_cumsum_exp = g_key_cumsum.exp() 
+
+    g_value = F.logsigmoid(g_value)
+    g_value_cumsum = g_value.cumsum(-2)
+    reduce_chunk_value = (g_value_cumsum[..., -1, None, :] - g_value_cumsum).exp()
+    g_value_cumsum_exp = g_value_cumsum.exp()
+    
+    to_add = (key * reduce_chunk_key).transpose(-1, -2) @  (value * reduce_chunk_value)
+
+    return to_add, g_key_cumsum, g_value_cumsum
         
     
-
 def torch_chunk_parallel_onc(
     key, value,
     g_key, g_value, 
@@ -240,35 +250,34 @@ def torch_chunk_parallel_onc(
     g_key = rearrange(g_key, 'b h (n c) d -> b h n c d', c = chunk_size)
     g_value = rearrange(g_value, 'b h (n c) d -> b h n c d', c = chunk_size)
     
-    g_key_cumsum = g_key.cumsum(-2)
-    g_value_cumsum = g_value.cumsum(-2)
+    # g_key_cumsum = g_key.cumsum(-2)
+    # g_value_cumsum = g_value.cumsum(-2)
 
-    reduce_chunk_key = (g_key_cumsum[..., -1, None, :] -  g_key_cumsum).exp()
-    reduce_chunk_value = (g_value_cumsum[..., -1, None, :] - g_value_cumsum).exp()
+    # reduce_chunk_key = (g_key_cumsum[..., -1, None, :] -  g_key_cumsum).exp()
+    # reduce_chunk_value = (g_value_cumsum[..., -1, None, :] - g_value_cumsum).exp()
     
-    to_add = (key * reduce_chunk_key).transpose(-1, -2) @  (value * reduce_chunk_value)
+    # to_add = (key * reduce_chunk_key).transpose(-1, -2) @  (value * reduce_chunk_value)
 
-    decay_key = (g_key_cumsum).exp()
-    decay_value = (g_value_cumsum).exp()
+    # decay_key = (g_key_cumsum).exp()
+    # decay_value = (g_value_cumsum).exp()
 
-    decay_key_last = decay_key[..., -1, :]
-    decay_value_last = decay_value[..., -1, :]
+    # decay_key_last = decay_key[..., -1, :]
+    # decay_value_last = decay_value[..., -1, :]
 
-    memory_cache = Chunk_memory_update.apply(decay_key_last, decay_value_last, to_add,use_triton)    
+    to_add, g_key_cumsum, g_value_cumsum = prepare_to_add(g_key, g_value, key, value)
 
+    decay_key_last = g_key_cumsum[..., -1, :].exp()
+    decay_value_last = g_value_cumsum[..., -1, :].exp()
 
+    memory_cache = Chunk_memory_update.apply(decay_key_last, decay_value_last, to_add, use_triton)    
 
-    inter_chunk_contribution = compute_inter(query,  decay_key,  memory_cache, decay_value)
+    inter_chunk_contribution = compute_inter(query, g_key_cumsum,  memory_cache, g_value_cumsum)
     
-    if not use_cuda:
-        mask = torch.triu(torch.ones(chunk_size, chunk_size, device=query.device, dtype=torch.bool), diagonal=1)
-        inner_chunk_contribution = compute_inner(query, key, value, decay_key, decay_value, mask) 
-    else:
-        inner_chunk_contribution, _ = cuda_compute_intra(query, key, value, g_key_cumsum, g_value_cumsum)
+    inner_chunk_contribution, _ = cuda_compute_intra(query, key, value, g_key_cumsum, g_value_cumsum)
     
     output = inter_chunk_contribution + inner_chunk_contribution    
-    return rearrange(output, 'b h n c d -> b h (n c) d')
 
+    return rearrange(output, 'b h n c d -> b h (n c) d')
 
 
 def torch_recurrent_on(v1, v2, g1, g2, q):
@@ -293,10 +302,6 @@ if __name__ == "__main__":
     chunk_size = 16
     device = "cuda"
     requires_grad = True
-
-
-
-
 
     v1 = (torch.randn(B, H,  L, D) ).cuda().requires_grad_(requires_grad)  
     v2 = (torch.randn(B, H, L, D) ).cuda().requires_grad_(requires_grad) 
