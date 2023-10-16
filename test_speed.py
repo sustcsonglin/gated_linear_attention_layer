@@ -54,13 +54,23 @@ if __name__ == "__main__":
     end = time.time()
     print("triton attention time", end - start)
 
+    torch.cuda.synchronize()
 
     start = time.time()
     for _ in range(1000):
-        output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=chunk_size,use_triton=True)
+        output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=chunk_size,use_triton=True, use_cuda=True)
     torch.cuda.synchronize()
     end = time.time()
-    print("gated retnet time", end - start)
+    print("gated retnet time w/ cuda", end - start)
+
+    torch.cuda.synchronize()
+
+    start = time.time()
+    for _ in range(1000):
+        output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=chunk_size,use_triton=True, use_cuda=False)
+    torch.cuda.synchronize()
+    end = time.time()
+    print("gated retnet time w/o cuda", end - start)
 
 
 

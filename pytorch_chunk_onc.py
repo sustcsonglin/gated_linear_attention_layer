@@ -7,19 +7,21 @@ from cuda import cuda_compute_intra
 import torch.nn.functional as F
 
 
-
-
 @torch.jit.script
 def compute_inner(query, key, value, decay_key, decay_value, mask):
     original_dtype = query.dtype
-    query = (query * decay_key).double()
-    key = key.double() / decay_key.double()
+    decay_key = decay_key.float().exp()
+    decay_value = decay_value.float().exp()    
+    query = query.float()
+    key = key.float()
+    value = value.float()
 
+    query = (query * decay_key)
+    key = key / decay_key.clamp_min(1e-6)
     qk = (query @ key.transpose(-1, -2)).masked_fill_(mask, 0)     
-    value = value.double() / decay_value.double()
-  
-    return ((qk @ value) * decay_value).to(original_dtype)
+    value = value / decay_value.clamp_min(1e-6)    
 
+    return ((qk @ value) * decay_value).to(original_dtype)
 
 
 
@@ -34,27 +36,29 @@ def _fwd_recurrence(
     S, p1, p2, 
     O,
     NUM_BLOCK, 
-    D_MODEL,
+    D_MODEL_K: tl.constexpr, D_MODEL_V: tl.constexpr,
     BLOCK_MODEL: tl.constexpr
   ):
     offset_bh = tl.program_id(0)
     offset_d = tl.program_id(1)
     offset_s = tl.program_id(2)    
     
-    S = S + offset_bh * NUM_BLOCK * D_MODEL * D_MODEL + offset_d * D_MODEL * BLOCK_MODEL  +  tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :]
+    S = S + offset_bh * NUM_BLOCK * D_MODEL_K * D_MODEL_V + offset_d * D_MODEL_V * BLOCK_MODEL  +  tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL_V + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :]
 
-    O = O + offset_bh * NUM_BLOCK * D_MODEL * D_MODEL + offset_d * D_MODEL * BLOCK_MODEL +  tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :] +  D_MODEL * D_MODEL    
+    O = O + offset_bh * NUM_BLOCK * D_MODEL_K * D_MODEL_V + offset_d * D_MODEL_V * BLOCK_MODEL  +  tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL_V + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :] +  D_MODEL_K * D_MODEL_V    
 
-    p1 = p1 + offset_bh * NUM_BLOCK * D_MODEL + tl.arange(0, BLOCK_MODEL) + offset_d * BLOCK_MODEL + D_MODEL     
-    p2 = p2 + offset_bh * NUM_BLOCK * D_MODEL + tl.arange(0, BLOCK_MODEL) + offset_s * BLOCK_MODEL + D_MODEL  
+    p1 = p1 + offset_bh * NUM_BLOCK * D_MODEL_K + tl.arange(0, BLOCK_MODEL) + offset_d * BLOCK_MODEL + D_MODEL_K     
+
+    p2 = p2 + offset_bh * NUM_BLOCK * D_MODEL_V + tl.arange(0, BLOCK_MODEL) + offset_s * BLOCK_MODEL + D_MODEL_V  
 
     acc = tl.zeros([BLOCK_MODEL, BLOCK_MODEL], dtype=tl.float32)
+
     acc += tl.load(S)    
     
-    S += D_MODEL * D_MODEL    
+    S += D_MODEL_K * D_MODEL_V    
 
     tl.store(O, acc.to(O.dtype.element_ty))
-    O += D_MODEL * D_MODEL
+    O += D_MODEL_K * D_MODEL_V
 
     for i in range(NUM_BLOCK-2):
         p_k = tl.load(p1)
@@ -62,36 +66,38 @@ def _fwd_recurrence(
         S_i = tl.load(S) 
         acc = acc * p_k[:, None] * p_v[None, :] + S_i
         tl.store(O, acc.to(O.dtype.element_ty))
-        p1 +=  D_MODEL
-        p2 += D_MODEL
-        S +=  D_MODEL * D_MODEL
-        O +=  D_MODEL * D_MODEL        
+        p1 +=  D_MODEL_K
+        p2 += D_MODEL_V
+        S +=  D_MODEL_K * D_MODEL_V
+        O +=  D_MODEL_K * D_MODEL_V       
 
 @triton.jit
 def _bwd_recurrence(
     S, p1, p2, 
     DS, Dp,
     NUM_BLOCK, 
-    D_MODEL, 
+    D_MODEL_K: tl.constexpr, D_MODEL_V: tl.constexpr,
     BLOCK_MODEL: tl.constexpr
  ):
     offset_bh = tl.program_id(0)
     offset_d = tl.program_id(1)
     offset_s = tl.program_id(2)    
 
-    S = S + offset_bh * NUM_BLOCK * D_MODEL * D_MODEL + offset_d * D_MODEL * BLOCK_MODEL  +  tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :]  + (NUM_BLOCK - 2) * D_MODEL * D_MODEL
+    S = S + offset_bh * NUM_BLOCK * D_MODEL_K * D_MODEL_V + offset_d * D_MODEL_V * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL_V + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :]  + (NUM_BLOCK - 2) * D_MODEL_K * D_MODEL_V
 
-    DS = DS + offset_bh * NUM_BLOCK * D_MODEL * D_MODEL + offset_d * D_MODEL * BLOCK_MODEL  +  tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :] + (NUM_BLOCK - 1) * D_MODEL * D_MODEL
+    DS = DS + offset_bh * NUM_BLOCK * D_MODEL_K * D_MODEL_V + offset_d * D_MODEL_V * BLOCK_MODEL  +  tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL_V + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :]  + (NUM_BLOCK - 1) * D_MODEL_K * D_MODEL_V
 
-    p1 = p1 + offset_bh * NUM_BLOCK * D_MODEL + tl.arange(0, BLOCK_MODEL) + offset_d * BLOCK_MODEL + D_MODEL + (NUM_BLOCK - 1) * D_MODEL 
+    p1 = p1 + offset_bh * NUM_BLOCK * D_MODEL_K + tl.arange(0, BLOCK_MODEL) + offset_d * BLOCK_MODEL + (NUM_BLOCK - 1) * D_MODEL_K 
 
-    p2 = p2 + offset_bh * NUM_BLOCK * D_MODEL + tl.arange(0, BLOCK_MODEL) + offset_d * BLOCK_MODEL + D_MODEL +  (NUM_BLOCK - 1) * D_MODEL 
+    p2 = p2 + offset_bh * NUM_BLOCK * D_MODEL_V + tl.arange(0, BLOCK_MODEL) + offset_s * BLOCK_MODEL + (NUM_BLOCK - 1) * D_MODEL_V 
     
-    Dp = Dp + offset_bh * NUM_BLOCK * D_MODEL * D_MODEL + offset_d * D_MODEL * BLOCK_MODEL  +  tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :] + (NUM_BLOCK - 1) * D_MODEL * D_MODEL
+
+    Dp = Dp + offset_bh * NUM_BLOCK * D_MODEL_K * D_MODEL_V + offset_d * D_MODEL_V * BLOCK_MODEL  +  tl.arange(0, BLOCK_MODEL)[:, None] * D_MODEL_V + offset_s * BLOCK_MODEL + tl.arange(0, BLOCK_MODEL)[None, :] + (NUM_BLOCK - 1) * D_MODEL_K * D_MODEL_V
 
     Dacc = tl.zeros([BLOCK_MODEL, BLOCK_MODEL], dtype=tl.float32)
 
     for i in range(NUM_BLOCK - 2, -1, -1):
+
         S_i = tl.load(S)
 
         DS_i = tl.load(DS)
@@ -99,18 +105,18 @@ def _bwd_recurrence(
         dp_i = DS_i * S_i
 
         p_key = tl.load(p1)
+
         p_value = tl.load(p2)
 
         Dacc = Dacc * p_key[:, None] * p_value[None, :] + DS_i 
                 
-        tl.store(S, Dacc.to(S.dtype.element_ty))
-        
-        S -= D_MODEL * D_MODEL
-        DS -= D_MODEL * D_MODEL
-        p1 -= D_MODEL
-        p2 -= D_MODEL
-        Dp -= D_MODEL * D_MODEL 
+        tl.store(S, Dacc.to(S.dtype.element_ty))        
 
+        S -= D_MODEL_K * D_MODEL_V 
+        DS -= D_MODEL_K * D_MODEL_V 
+        p1 -= D_MODEL_K 
+        p2 -= D_MODEL_V 
+        Dp -= D_MODEL_K * D_MODEL_V
 
 
 
@@ -123,35 +129,31 @@ class Chunk_memory_update(torch.autograd.Function):
 
         ctx.use_triton = use_triton
         
-        B, H, N, D, D = to_add.shape 
-        assert D % 32 == 0
+        B, H, N, D_k, D_v = to_add.shape 
+
+        output = torch.empty_like(to_add)        
+
+        BLOCK_MODEL = 32
+    
+        assert D_k % 32 == 0
+        assert D_v % 32 == 0
+        assert D_k == decay_key_last.shape[-1]
+        assert D_v == decay_value_last.shape[-1]
+
+        grid = (B*H, D_k//BLOCK_MODEL, D_v//BLOCK_MODEL)
+        ctx.grid = grid 
+        ctx.BLOCK_MODEL = BLOCK_MODEL
+
+        _fwd_recurrence[grid](
+            to_add,  
+            decay_key_last,
+            decay_value_last,
+            output,
+            D_MODEL_K=D_k, D_MODEL_V=D_v,
+            NUM_BLOCK=N,  
+            BLOCK_MODEL=BLOCK_MODEL
+        )
         
-        output = torch.empty_like(to_add)
-
-
-        if not use_triton:
-            memory = torch.zeros(B, H, D, D).to(to_add)          
-            for i in range(N-1):
-                memory = memory * decay_key_last[:, :, i].unsqueeze(-1) * decay_value_last[:, :, i].unsqueeze(-2) + to_add[:, :, i]
-                output[:, :, i+1] = memory.clone()        
-        else:
-            
-            BLOCK_MODEL = 32
-            BLOCK_S = 32
-            grid = (B*H, D//BLOCK_MODEL, D//BLOCK_MODEL)
-            ctx.grid = grid 
-            ctx.BLOCK_MODEL = BLOCK_MODEL
-
-            _fwd_recurrence[grid](
-                to_add,  
-                decay_key_last,
-                decay_value_last,
-                output,
-                D_MODEL=D, NUM_BLOCK=N,  
-                BLOCK_MODEL=BLOCK_MODEL
-            )
-            
-
         output[:, :, 0] = 0
         ctx.save_for_backward(output, decay_key_last, decay_value_last)        
         
@@ -163,66 +165,40 @@ class Chunk_memory_update(torch.autograd.Function):
 
         output, decay_key_last, decay_value_last = ctx.saved_tensors 
 
-        B, H, N, D, D = output.shape 
+        B, H, N, D_k, D_v = output.shape 
 
-        Dacc1 = torch.zeros(B, H, D, D).to(output)
         num_block = N
 
-        if not ctx.use_triton:
-            D_p1 = torch.empty_like(decay_key_last)
-            D_p2 = torch.empty_like(decay_value_last)
-             
-            for i in range(num_block - 2, -1, -1):
-                tmp = (output[:, :, i].clone() * DO[:, :, i+1]) 
-                dp1 = tmp.sum(-1)
-                dp2 = tmp.sum(-2)
-                D_p1[:, :, i+1] = dp1 
-                D_p2[:, :, i+1] = dp2
-                
-                p1 = decay_key_last[:, :, i+1]
-                p2 = decay_value_last[:, :, i+1]
-                Dacc1 = Dacc1 * p1.unsqueeze(-1) * p2.unsqueeze(-2)  + DO[:, :, i+1] 
-                output[:, :, i] = Dacc1.clone()
+        grid = ctx.grid 
+        BLOCK_MODEL = ctx.BLOCK_MODEL 
+        D_p = torch.zeros_like(DO)
 
-            
-
-            output[:, :, -1] = 0
-            D_p1[:, :, 0] = 0
-            D_p2[:, :, 0] = 0
-
-            return D_p1, D_p2, output, None
+        _bwd_recurrence[grid](
+            output, decay_key_last, decay_value_last,
+            DO, D_p, 
+            NUM_BLOCK = num_block, 
+            D_MODEL_K = D_k,
+            D_MODEL_V = D_v, 
+            BLOCK_MODEL = BLOCK_MODEL
+        )
+        output[:, :, -1] = 0
+        D_p[:, :, 0] = 0
+        return D_p.sum(-1), D_p.sum(-2), output, None         
         
-        else:
-            grid = ctx.grid 
-            BLOCK_MODEL = ctx.BLOCK_MODEL 
-            D_p = torch.zeros_like(DO)
-
-            _bwd_recurrence[grid](
-                output, decay_key_last, decay_value_last,
-                DO, D_p, 
-                NUM_BLOCK = num_block, 
-                D_MODEL = D, 
-                BLOCK_MODEL = BLOCK_MODEL
-            )
-            output[:, :, -1] = 0
-            D_p[:, :, 0] = 0
-            return D_p.sum(-1), D_p.sum(-2), output, None 
-
-
-        
-            
 
 @torch.jit.script
 def prepare_to_add(g_key, g_value, key, value):
     g_key = F.logsigmoid(g_key)
     g_key_cumsum = g_key.cumsum(-2)
     reduce_chunk_key = (g_key_cumsum[..., -1, None, :] -  g_key_cumsum).exp()
-    g_key_cumsum_exp = g_key_cumsum.exp() 
+
+    # g_key_cumsum_exp = g_key_cumsum.exp() 
 
     g_value = F.logsigmoid(g_value)
     g_value_cumsum = g_value.cumsum(-2)
     reduce_chunk_value = (g_value_cumsum[..., -1, None, :] - g_value_cumsum).exp()
-    g_value_cumsum_exp = g_value_cumsum.exp()
+
+    # g_value_cumsum_exp = g_value_cumsum.exp()
     
     to_add = (key * reduce_chunk_key).transpose(-1, -2) @  (value * reduce_chunk_value)
 
@@ -273,7 +249,12 @@ def torch_chunk_parallel_onc(
 
     inter_chunk_contribution = compute_inter(query, g_key_cumsum,  memory_cache, g_value_cumsum)
     
-    inner_chunk_contribution, _ = cuda_compute_intra(query, key, value, g_key_cumsum, g_value_cumsum)
+
+    if use_cuda:
+        inner_chunk_contribution, _ = cuda_compute_intra(query, key, value, g_key_cumsum, g_value_cumsum)
+    else:
+        mask = torch.triu(torch.ones(chunk_size, chunk_size, device=query.device, dtype=torch.bool), diagonal=1)
+        inner_chunk_contribution = compute_inner(query, key, value, g_key_cumsum, g_value_cumsum, mask=mask)
     
     output = inter_chunk_contribution + inner_chunk_contribution    
 
@@ -285,6 +266,8 @@ def torch_recurrent_on(v1, v2, g1, g2, q):
     hidden_state = torch.zeros(B, H, D, D).to(v1)
 
     O = torch.empty(B, H, L, D).to(v1)
+    g1 = F.logsigmoid(g1)
+    g2 = F.logsigmoid(g2)
 
     for i in range(L):
         hidden_state = hidden_state * (g1[:, :, i].unsqueeze(-2) + g2[:, :, i].unsqueeze(-1)).exp() + v1[:, :, i].unsqueeze(-2) * v2[:, :, i].unsqueeze(-1)        
@@ -294,11 +277,13 @@ def torch_recurrent_on(v1, v2, g1, g2, q):
 
     return O
 
+
+
 if __name__ == "__main__":
     B = 1
     H = 8
-    L = 32
-    D = 128
+    L = 64
+    D = 64
     chunk_size = 16
     device = "cuda"
     requires_grad = True
