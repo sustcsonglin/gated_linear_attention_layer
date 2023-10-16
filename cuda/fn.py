@@ -20,6 +20,7 @@ class CUDA_inner(torch.autograd.Function):
         original_dtype = q.dtype
 
         assert q.shape[-1] % 64 == 0
+        assert v.shape[-1] % 64 == 0
         assert q.shape[-2] == 16
 
         q = q.float().contiguous()
