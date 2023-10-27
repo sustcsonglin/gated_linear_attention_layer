@@ -338,6 +338,7 @@ if __name__ == "__main__":
     chunk_size = 16
     device = "cuda"
     requires_grad = True
+    torch.set_default_dtype(torch.bfloat16)
 
     # verify the graident of chunk memory update 
     # torch.manual_seed(20)
@@ -367,51 +368,36 @@ if __name__ == "__main__":
     for g1, g2 in zip(grad1, grad2):
         print( (g1 - g2).abs().max())
 
-    breakpoint()
+    # breakpoint()
+
+    v1 = (torch.randn(B, H,  L, D) ).cuda().requires_grad_(requires_grad)  
+    v2 = (torch.randn(B, H, L, D) ).cuda().requires_grad_(requires_grad) 
+    g1 = torch.randn(B, H,  L, D).cuda().requires_grad_(requires_grad)
+    g2 = torch.randn(B, H, L, D).cuda().requires_grad_(requires_grad)
+    q = (torch.randn(B, H, L, D) * 5).cuda().requires_grad_(requires_grad)  
 
 
-
-    # v1 = (torch.randn(B, H,  L, D) ).cuda().requires_grad_(requires_grad)  
-    # v2 = (torch.randn(B, H, L, D) ).cuda().requires_grad_(requires_grad) 
-    # g1 = torch.randn(B, H,  L, D).cuda().uniform_(0, 0.99).log().requires_grad_(requires_grad)
-    # g2 = torch.randn(B, H, L, D).cuda().uniform_(0, 0.99).log().requires_grad_(requires_grad)
-    # # g1 = torch.zeros(B, H, L, D)
-    # # g2 = torch.zeros(B, H, L, D)
-    # q = (torch.randn(B, H, L, D) * 5).cuda().requires_grad_(requires_grad)  
-
-
-
-
-
-
-
-
-
-
-
-    # output1 = torch_recurrent_on(v1, v2, g1, g2, q)
-    # output1.sum().backward()
-    # target = [v1, v2, g1, g2, q]
-    # grad1= [ ]
-    # for v in target:
-    #     grad1.append(v.grad.clone())
-    #     v.grad.zero_()
+    output1 = torch_recurrent_on(v1, v2, g1, g2, q)
+    output1.sum().backward()
+    target = [v1, v2, g1, g2, q]
+    grad1= [ ]
+    for v in target:
+        grad1.append(v.grad.clone())
+        v.grad.zero_()
 
     
 
-    # output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=chunk_size,use_triton=True)
-    # output2.sum().backward()
-    # grad2= [ ]
-    # for v in target:
-    #     grad2.append(v.grad.clone())
-    #     v.grad.zero_()
+    output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=chunk_size,use_triton=True)
+    output2.sum().backward()
+    grad2= [ ]
+    for v in target:
+        grad2.append(v.grad.clone())
+        v.grad.zero_()
 
+    print( (output1 - output2).abs().max())
 
-
-    # print( (output1 - output2).abs().max())
-
-    # for g1, g2 in zip(grad1, grad2):
-    #     print( (g1 - g2).abs().max())
+    for g1, g2 in zip(grad1, grad2):
+        print( (g1 - g2).abs().max())
 
         
 
