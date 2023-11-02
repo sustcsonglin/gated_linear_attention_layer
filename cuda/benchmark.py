@@ -6,39 +6,38 @@ import time
 def compute_intra(query, key, value, decay_key, decay_value, mask):
     original_dtype = query.dtype
 
-
     query = query.float()
     key = key.float()
-    value = value.float()
+    # value = value.float()
 
     decay_key = decay_key.float()
-    decay_value = decay_value.float()
+    # decay_value = decay_value.float()
 
     decay_key = decay_key.exp()
-    decay_value = decay_value.exp()
+    # decay_value = decay_value.exp()
     query = (query * decay_key)
     key = key / decay_key
 
-
     qk = (query @ key.transpose(-1, -2)).masked_fill_(mask, 0)     
-    value = value / decay_value
+
+
+    # value = value / decay_value
   
-    return ((qk @ value) * decay_value).to(original_dtype), qk
-    # return qk 
+    # return ((qk @ value) * decay_value).to(original_dtype), qk
+    return qk 
 
 
 
-from fn_chunk128_dim128 import cuda_compute_intra_chunk128_d128
-
+from fn_chunk64x_dim64x import CUDA_inner
 
 batch = 4
 num_head = 4
 num_chunk = 16
 chunk_size = 64
 d_head_k = 256
-d_head_v = 256
+d_head_v = 512
 
-requires_grad = False
+requires_grad = True
 
 mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device='cuda'), diagonal=1)
 
@@ -61,13 +60,14 @@ g_B = g_B_cumsum.detach().clone().contiguous().requires_grad_(requires_grad)
 
 for _ in range(100):
     
-    C, _ = cuda_compute_intra_chunk128_d128(Q, K, V, g_A, g_B)
+    C = CUDA_inner.apply(Q, K,g_A)
     if requires_grad:
         C.sum().backward(retain_graph=True)
-    
-    C2, _ = compute_intra(Q, K, V, g_A, g_B, mask)
+
+    C2 = compute_intra(Q, K, V, g_A, g_B, mask)
     if requires_grad:
         C2.sum().backward(retain_graph=True)
+
 
     # _ = compute_intra(Q, K, V, g_A, g_B, mask)
 
@@ -95,9 +95,11 @@ torch.cuda.reset_max_memory_allocated()
 torch.cuda.synchronize()
 start = time.time()
 for _ in range(1000):
-    C, _  = cuda_compute_intra_chunk128_d128(Q, K, V, g_A, g_B)
+
+    C = CUDA_inner.apply(Q, K,g_A)
     if requires_grad:
         C.sum().backward(retain_graph=True)
+
 
 
 torch.cuda.synchronize()
@@ -110,7 +112,7 @@ torch.cuda.synchronize()
 start = time.time()
 
 for _ in range(1000):
-    C, _  = compute_intra(Q, K, V, g_A, g_B, mask)
+    C  = compute_intra(Q, K, V, g_A, g_B, mask)
     if requires_grad:
         C.sum().backward(retain_graph=True)
 
@@ -120,4 +122,5 @@ torch.cuda.synchronize()
 print("Pytorch")
 print("Time:", time.time() - start)
 print("Max GPU memopry:", torch.cuda.max_memory_allocated() // 1024 // 1024)
+
 

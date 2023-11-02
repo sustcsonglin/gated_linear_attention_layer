@@ -55,7 +55,6 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
   float * G_A = G + batchIdx * M * K + cRow * 64 * K;
   float * G_B = G + batchIdx * K * N + cCol * 64 * K;
   
-
   // calculating the indices that this thread will load into SMEM
   // we'll load 128bit / 32bit = 4 elements per thread at each step
   const uint innerRowA = threadIdx.x / (BK / 4);
@@ -369,7 +368,7 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void __launch_bounds__(K9_NUM_THREADS)
     bwd_dv_chunk128(int M, int N, int K, float *A, float *B, 
-                   float *G, float *C, float *V, float *DG, float *O){
+                   float *G, float *C, float *V, float *DG){
 
   // static_assert(M == K, "M should equal to K");
 
@@ -549,9 +548,7 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
       float *C_interim = C + (wmIdx * WM * N) + (wnIdx * WN);
       float *DG_interim = DG + (wmIdx * WM * N) + (wnIdx * WN);
       
-      float *O_interim = O + (wmIdx * WM * N) + (wnIdx * WN);
       float *DO_interim = B2 + (wmIdx * WM * N) + (wnIdx * WN);
-
 
       for (uint resIdxM = 0; resIdxM < TM; resIdxM += 1) {
         for (uint resIdxN = 0; resIdxN < TN; resIdxN += 4) {
@@ -607,7 +604,7 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void __launch_bounds__(K9_NUM_THREADS)
     bwd_dq_chunk128(int M, int N, int K, float *A, float *B, 
-                   float *G, float *C, float *V, float *DG, float *O){
+                   float *G, float *C, float *V, float *DG){
 
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.z;
@@ -752,9 +749,7 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
                   (( regGN[idx] <= regGM[resIdxN]) ? expf(regGN[idx] - regGM[resIdxN]) : 0);                  
               
               regDV[idx] += tmp;
-              regDGN[idx] += tmp * regV[idx];
-
-              // * regV[idx];
+              regDGN[idx] += tmp * regV[idx];              
             }
           }
         }
@@ -823,12 +818,11 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
 
 
 
-void run_fwd_attn_chunk64x_dim64x(int batchSize, int M, int N_K, int N_V,
-                                float *Q, float *K, float *V, 
-                                float *gK, float *gV,
-                                float *QK,
-                                float *O) {  
-  
+void run_fwd_attn_chunk64x_dim64x(int batchSize, int M, int N_K,
+                                 float *Q, float *K,
+                                 float *gK,
+                                 float *QK                                
+                              ) {  
 
   // A100
   const uint K9_BK = 16;
@@ -846,8 +840,7 @@ void run_fwd_attn_chunk64x_dim64x(int batchSize, int M, int N_K, int N_V,
   // const uint K9_BN = 128;
   // const uint K9_NUM_THREADS = 256;
 
-  dim3 blockDim(K9_NUM_THREADS);
-
+  dim3 blockDim(K9_NUM_THREADS);    
   static_assert(
       (K9_NUM_THREADS * 4) % K9_BK == 0,
       "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization issues "
@@ -874,25 +867,15 @@ void run_fwd_attn_chunk64x_dim64x(int batchSize, int M, int N_K, int N_V,
   fwd_attn_chunk128<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
   <<<gridDim, blockDim>>>(M, M, N_K, Q, K, gK, QK); 
   
-  dim3 gridDim2(batchSize, M / K9_BM, N_V / K9_BN);
-
-  fwd_o_chunk128<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
-  <<<gridDim2, blockDim>>>(M, N_V, M, QK, V, gV, O); 
+  // dim3 gridDim2(batchSize, M / K9_BM, N_V / K9_BN);
+  // fwd_o_chunk128<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
+  // <<<gridDim2, blockDim>>>(M, N_V, M, QK, V, gV, O); 
 
 
 }
 
-
-
-
-void run_bwd_o_chunk64x_dim64x(int batchSize, int M, int N_K, int N_V,  
-                                float *Q, float *K, float *V,
-                                float *gK, float *gV, float *QK,
-                                float *O,
-                                float *DO,
-                                float *DQ, float *DK, float *DV,
-                                float *DgK, float *DgV, 
-                                float *DQK
+void run_bwd_o_chunk64x_dim64x(int batchSize, int M, int N_K,                                  float *DQK, float *Q, float *K, float *gK, 
+float *DQ, float *DK, float *DgK
                                 ){
   // A100
   const uint K9_BK = 16;
@@ -901,14 +884,6 @@ void run_bwd_o_chunk64x_dim64x(int batchSize, int M, int N_K, int N_V,
   const uint K9_BM = 64;
   const uint K9_BN = 64;
   const uint K9_NUM_THREADS = 256;
-
-  // // A6000
-  // const uint K9_BK = 16;
-  // const uint K9_TM = 8;
-  // const uint K9_TN = 8;
-  // const uint K9_BM = 128;
-  // const uint K9_BN = 128;
-  // const uint K9_NUM_THREADS = 256;
 
   dim3 blockDim(K9_NUM_THREADS);
 
@@ -938,29 +913,14 @@ void run_bwd_o_chunk64x_dim64x(int batchSize, int M, int N_K, int N_V,
   static_assert((K9_BN * K9_BK) % (4 * K9_NUM_THREADS) == 0,
                 "K9_BN*K9_BK must be a multiple of 4*256 to vectorize loads");
   
-  dim3 gridDim1(batchSize, M / 64, N_V / 64);
-  
-  bwd_dv_chunk128<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
-  <<<gridDim1, blockDim>>>(M, N_V, M, QK, DO, gV, DV, V, DgV, O); 
 
-  dim3 gridDim2(batchSize, M / 64, M / 64);
-  fwd_attn_chunk128<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
-  <<<gridDim2, blockDim>>>(M, M, N_V, DO, V, gV, DQK); 
-
-  // fwd_o_chunk128<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
-  // <<<gridDim, blockDim>>>(128, 128, 128, DQK, Q, gK, DK); 
-  //gradient of DV and DgK
-  
   dim3 gridDim3(batchSize, M / 64, N_K / 64);
   bwd_dv_chunk128<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
-  <<<gridDim3, blockDim>>>(M, N_K, M, DQK, Q, gK, DK, K, DgK, O); 
+  <<<gridDim3, blockDim>>>(M, N_K, M, DQK, Q, gK, DK, K, DgK); 
 
   dim3 gridDim4(batchSize, M / 64, N_K / 64);
   bwd_dq_chunk128<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
-  <<<gridDim4, blockDim>>>(M, N_K, M, DQK, K, gK, DQ, Q, DgK, O); 
-
-  // bwd_attn_chunk128<K9_BM, K9_BN, K9_BK, K9_TM, K9_TN>
-  // <<<gridDim, blockDim>>>(128, 128, 128, Q, K, gK, QK);  
+  <<<gridDim4, blockDim>>>(M, N_K, M, DQK, K, gK, DQ, Q, DgK); 
 
 }             
 
@@ -982,6 +942,7 @@ void run_bwd_o_chunk64x_dim64x(int batchSize, int M, int N_K, int N_V,
 //     compute_d_kernel
 //     <<<gridDim, blockDim>>>(batchSize, M, N_K, N_V, Q, K, V, gK, gV, QK, DO, DQ, DK, DV, DgK, DgV); 
 // }
+
 
 
 

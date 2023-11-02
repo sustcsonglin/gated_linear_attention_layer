@@ -5,8 +5,10 @@ import triton
 import triton.language as tl
 from cuda import cuda_compute_intra
 from pytorch_chunk_onc import torch_chunk_parallel_onc 
-from fused_onc import fused_chunk_parallel_onc
+# from fused_onc import fused_chunk_parallel_onc
+from fused_chunk_onc import fused_chunk_parallel_onc
 from pytorch_chunk_onc_v2 import torch_chunk_parallel_onc_v2 
+from pytorch_chunk_onc_nogv import torch_chunk_parallel_onc_nogv
 
 from triton_flashattn import attention 
 
@@ -37,17 +39,18 @@ if __name__ == "__main__":
         output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=chunk_size,use_triton=True, use_cuda=True)
         if requires_grad:
             output2.sum().backward(retain_graph=True)
-        output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=128,use_triton=True, use_cuda=True)
+        # output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=128,use_triton=True, use_cuda=True)
+        # if requires_grad:
+            # output2.sum().backward(retain_graph=True)
+        
+        # output2 = fused_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=16,use_triton=True, use_cuda=True)
+
+        output2 =  torch_chunk_parallel_onc_nogv(v1, v2, g1, q, chunk_size=64,use_triton=True, use_cuda=True)
         if requires_grad:
             output2.sum().backward(retain_graph=True)
 
-        # output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=512,use_triton=True, use_fused_loop=True)
-        # if requires_grad:
-        #     output2.sum().backward(retain_graph=True)
 
-
-    print('warm up done')
-
+    # print('warm up done')
     torch.cuda.synchronize()
 
     start = time.time()
@@ -61,19 +64,30 @@ if __name__ == "__main__":
     end = time.time()
     print("gated retnet time, require_grad:{}", end - start, requires_grad)
 
-    torch.cuda.synchronize()
+    # torch.cuda.synchronize()
 
+    # start = time.time()
+    # for _ in range(1000):
+    #     output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=256,use_triton=True, use_cuda=False)
+    #     if requires_grad:
+    #         output2.sum().backward(retain_graph=True)    
+    # torch.cuda.synchronize()
+    # end = time.time()
+    # print("gated retnet time chunk 64, require_grad:{}", end - start, requires_grad)
+
+    torch.cuda.synchronize()
     start = time.time()
-    for _ in range(1000):
-        output2 = torch_chunk_parallel_onc(v1, v2, g1, g2, q, chunk_size=128,use_triton=True, use_cuda=True)
+    for i in range(1000):
+
+        output2 =  torch_chunk_parallel_onc_nogv(v1, v2, g1, q, chunk_size=64,use_triton=True, use_cuda=True)
         if requires_grad:
             output2.sum().backward(retain_graph=True)
-    
+
     torch.cuda.synchronize()
     end = time.time()
     print("gated retnet time chunk 64, require_grad:{}", end - start, requires_grad)
 
-    torch.cuda.synchronize()
+
 
 
     # start = time.time()
@@ -87,6 +101,8 @@ if __name__ == "__main__":
     # torch.cuda.synchronize()
     # end = time.time()
     # print("gated retnet time chunk 128 fused loop, require_grad:{}", end - start, requires_grad)
+
+
 
 
     # torch.cuda.synchronize()
