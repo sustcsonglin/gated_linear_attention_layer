@@ -255,7 +255,7 @@ def compute_inner_A(query, key, decay_key):
     # decay_value = decay_value.float().exp()    
     
     query = query.float()
-    key = key.float()
+    key = key.float()        
     # value = value.float()
 
     query = (query * decay_key)
@@ -292,7 +292,7 @@ class FlashGRet(torch.autograd.Function):
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             A.stride(0), A.stride(1), A.stride(2), A.stride(3),
             q.shape[0], q.shape[1], q.shape[2], q.shape[3],            
-            BLOCK_N=BLOCK_N, BLOCK_DMODEL_QK=Lk, BLOCK_M=BLOCK_M, num_warps=8, num_stages=4
+            BLOCK_N=BLOCK_N, BLOCK_DMODEL_QK=Lk, BLOCK_M=BLOCK_M, num_warps=8, num_stages=8
         )
 
         ctx.save_for_backward(q, k, gk)
@@ -326,10 +326,11 @@ class FlashGRet(torch.autograd.Function):
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             dA.stride(0), dA.stride(1), dA.stride(2), dA.stride(3),
             q.shape[0], q.shape[1], q.shape[2], q.shape[3],
-            BLOCK_N=BLOCK_N, BLOCK_DMODEL_QK=Lk, BLOCK_M=BLOCK_M, num_warps=8, num_stages=1
+            BLOCK_N=BLOCK_N, BLOCK_DMODEL_QK=Lk, BLOCK_M=BLOCK_M, num_warps=16, num_stages=1
         )
         
         return dq, dk, dgk, None
+
 
 
     
@@ -368,6 +369,9 @@ if __name__ == "__main__":
     # gk2 = (rearrange(gk3, 'b h (n c) d -> b h n c d', c=64)).cumsum(-2)
     # gv2 = (rearrange(gv3, 'b h (n c) d -> b h n c d', c=32)).cumsum(-2)
     # breakpoint()
+    print("starting.")
+
+
 
     o = FlashGRet.apply(q, k, gk3)
     o2 = compute_inner_A(q, k, gk3)
