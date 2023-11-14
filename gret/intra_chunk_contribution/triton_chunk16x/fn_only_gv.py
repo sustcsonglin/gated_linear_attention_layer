@@ -43,42 +43,44 @@ def _fwd_compute_O(
         acc = tl.zeros([16, BLOCK_DMODEL_V], dtype=tl.float32)
         
         # k_gv = tl.load(GV_ptr + q_high * stride_v4)
-        # q_gv = tl.exp(k_gv - q_gv_normalizer[None, :])
+        # q_gv = tl.math.exp(k_gv - q_gv_normalizer[None, :])
 
         for k_high in range(0, q_high, 16):            
             qk = tl.load(A_ptr + q_high * stride_a4 + k_high)                    
             v = tl.load(V_ptr + k_high * stride_v4)
             k_gv = tl.load(GV_ptr + k_high * stride_v4)
-            k_gv = tl.exp(q_gv_normalizer[None, :] - k_gv)
+            k_gv = tl.math.exp(q_gv_normalizer[None, :] - k_gv)
             v = v * k_gv.to(v.dtype)            
             #bf16
             output = tl.dot(qk, v, allow_tf32=False)        
             acc += output
-            
+
+        q_gv = tl.load(GV_ptr + q_high * stride_v4)
+        q_gv = tl.math.exp(q_gv - q_gv_normalizer[None, :])
+        acc = acc * q_gv
         tl.store(O_ptr + q_high * stride_v4, acc.to(O.dtype.element_ty))    
     
-    tl.debug_barrier()
-    
-    for q_high in range(lo, hi, 16):
-        q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
+    # tl.debug_barrier()
+    # for q_high in range(lo, hi, 16):
+    #     q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
 
-        qk = tl.load(A_ptr + q_high * stride_a4 + q_high)                            
-        v = tl.load(V_ptr + q_high * stride_v4)
-        k_gv = tl.load(GV_ptr + q_high * stride_v4)
-        k_gv2 = tl.exp(q_gv_normalizer[None, :] - k_gv)
+    #     qk = tl.load(A_ptr + q_high * stride_a4 + q_high)                            
+    #     v = tl.load(V_ptr + q_high * stride_v4)
+    #     k_gv = tl.load(GV_ptr + q_high * stride_v4)
+    #     k_gv2 = tl.math.exp(q_gv_normalizer[None, :] - k_gv)
         
-        #fp32 matmul
-        v = v * k_gv2
-        output = tl.dot(qk.to(tl.float32), v, allow_tf32=False)
+    #     #fp32 matmul
+    #     v = v * k_gv2
+    #     output = tl.dot(qk.to(tl.float32), v, allow_tf32=False)
         
-        q_gv = tl.exp(k_gv - q_gv_normalizer[None, :])
+    #     q_gv = tl.math.exp(k_gv - q_gv_normalizer[None, :])
 
-        prev = tl.load(O_ptr + q_high * stride_v4)
-        output += prev 
-        output = output * q_gv
+    #     prev = tl.load(O_ptr + q_high * stride_v4)
+    #     output += prev 
+    #     output = output * q_gv
+    #     tl.store(O_ptr + q_high * stride_v4, output.to(O.dtype.element_ty))
 
-        tl.store(O_ptr + q_high * stride_v4, output.to(O.dtype.element_ty))
-        
+
 
 @triton.jit
 def _bwd_kernel_dav(V, GV, A, O, 
@@ -89,7 +91,6 @@ def _bwd_kernel_dav(V, GV, A, O,
                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DMODEL_V: tl.constexpr
                 ):
     
-
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
 
@@ -121,10 +122,10 @@ def _bwd_kernel_dav(V, GV, A, O,
         
         q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
         q_gv = tl.load(GV_ptr + q_high * stride_v4)
-        q_gv = tl.exp(q_gv - q_gv_normalizer[None, :])
+        q_gv = tl.math.exp(q_gv - q_gv_normalizer[None, :])
         do = do * q_gv
 
-        tl.store(DO_ptr + q_high * stride_v4, do)
+        tl.store(DO_ptr + q_high * stride_v4, do.to(DO_ptr.dtype.element_ty))
         
     tl.debug_barrier()
 
@@ -132,20 +133,21 @@ def _bwd_kernel_dav(V, GV, A, O,
     GV_ptr = GV + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[:, None] + tl.arange(0, 16)[None, :] * stride_v4
 
     for q_high in range(lo+16, hi, 16):
-        do = tl.load(DO_ptr + q_high * stride_v4)            
+        do = tl.load(DO_ptr + q_high * stride_v4).to(tl.bfloat16)            
         q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, 
         BLOCK_DMODEL_V)).to(tl.float32)
         
         for k_high in range(0, q_high, 16):
             v = tl.load(V_ptr + k_high * stride_v4)
             k_gv = tl.load(GV_ptr + k_high * stride_v4)
-            k_gv = tl.exp(q_gv_normalizer[:, None] - k_gv)
+            k_gv = tl.math.exp(q_gv_normalizer[:, None] - k_gv)
             
             # bf16
             v2 = v * k_gv.to(v.dtype)            
             dqk = tl.dot(do, v2, allow_tf32=False)                        
             tl.store(DA_ptr + q_high * stride_a4 + k_high, dqk.to(DA.dtype.element_ty))          
     
+
     tl.debug_barrier()
 
     A_ptr = A + a_offset + (start_m) * stride_a3 + tl.arange(0, 16)[:, None] + tl.arange(0, 16)[ None, :] * stride_a4
@@ -153,19 +155,17 @@ def _bwd_kernel_dav(V, GV, A, O,
     V_ptr = V + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[ :, None] * stride_v4
     GV_ptr = GV + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[ :, None] * stride_v4
 
-
     for k_high in range(0, hi, 16):        
         dv = tl.zeros([16, BLOCK_DMODEL_V], dtype=tl.float32)
 
         k_gv = tl.load(GV_ptr + k_high * stride_v4)
 
         for q_high in range(k_high + 16, BLOCK_N, 16):
-            do = tl.load(DO_ptr + q_high * stride_v4)                        
-
+            do = tl.load(DO_ptr + q_high * stride_v4).to(tl.bfloat16)                        
             kq = tl.load(A_ptr + q_high * stride_a4 + k_high)            
 
             q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
-            k_gv2 = tl.exp(q_gv_normalizer[None, :] - k_gv)            
+            k_gv2 = tl.math.exp(q_gv_normalizer[None, :] - k_gv)            
 
             # bf16
             dv2 = tl.dot(kq, do, allow_tf32=False)            
@@ -178,35 +178,35 @@ def _bwd_kernel_dav(V, GV, A, O,
         tl.store(DGV_ptr + k_high * stride_v4, prev_dv - dv*v)
             
 
-    tl.debug_barrier()
 
-    A_ptr = A + a_offset + (start_m  ) * stride_a3 + tl.arange(0, 16)[:, None] + tl.arange(0, 16)[ None, :] * stride_a4 
+    ##### Numerical Issues. DO NOT USE MATMUL DIRECTLY FOR INTRA-CHUNK COMPUTATION.
+    # tl.debug_barrier()
+    # A_ptr = A + a_offset + (start_m  ) * stride_a3 + tl.arange(0, 16)[:, None] + tl.arange(0, 16)[ None, :] * stride_a4 
+    # #intra-chunk
+    # for q_high in range(lo, hi, 16):
+    #     do = tl.load(DO_ptr + q_high * stride_v4)            
 
+    #     q_gv_normalizer = tl.load(GV + v_offset + start_m * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
 
-    #intra-chunk
-    for q_high in range(lo, hi, 16):
-        do = tl.load(DO_ptr + q_high * stride_v4)            
+    #     v = tl.load(V_ptr + q_high * stride_v4)
+    #     k_gv = tl.load(GV_ptr + q_high * stride_v4)
+    #     k_gv = tl.math.exp(q_gv_normalizer[None, :] - k_gv)
+    #     v2 = v * k_gv
 
-        q_gv_normalizer = tl.load(GV + v_offset + start_m * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
+    #     dqk = tl.dot(do.to(v2.dtype), tl.trans(v2), allow_tf32=False)
+    #     dqk = tl.where(tl.arange(0, 16)[:, None] >= tl.arange(0, 16)[None, :], dqk, 0.)
+    #     tl.store(DA_ptr + q_high * stride_a4 + q_high, dqk.to(DA_ptr.dtype.element_ty))
 
-        v = tl.load(V_ptr + q_high * stride_v4)
-        k_gv = tl.load(GV_ptr + q_high * stride_v4)
-        k_gv = tl.exp(q_gv_normalizer[None, :] - k_gv)
-        v2 = v * k_gv
-
-        dqk = tl.dot(do.to(v2.dtype), tl.trans(v2), allow_tf32=False)
-        tl.store(DA_ptr + q_high * stride_a4 + q_high, dqk.to(DA_ptr.dtype.element_ty))
-
-        kq = tl.load(A_ptr + q_high * stride_a4 + q_high)
-        dv2 = tl.dot(kq, do, allow_tf32=False)
+    #     kq = tl.load(A_ptr + q_high * stride_a4 + q_high)
+    #     dv2 = tl.dot(kq, do, allow_tf32=False)
         
-        dv = dv2 * k_gv
-        prev_dv = tl.load(DV_ptr + q_high * stride_v4)
-        tl.store(DV_ptr + q_high * stride_v4, (prev_dv + dv).to(DV.dtype.element_ty))
+    #     dv = dv2 * k_gv
+    #     prev_dv = tl.load(DV_ptr + q_high * stride_v4)
+    #     tl.store(DV_ptr + q_high * stride_v4, (prev_dv + dv).to(DV.dtype.element_ty))
             
-        prev_gdv = tl.load(DGV_ptr + q_high * stride_v4)
-        prev_gdv -= dv * v 
-        tl.store(DGV_ptr + q_high * stride_v4, prev_gdv.to(DGV.dtype.element_ty))
+    #     prev_gdv = tl.load(DGV_ptr + q_high * stride_v4)
+    #     prev_gdv -= dv * v 
+    #     tl.store(DGV_ptr + q_high * stride_v4, prev_gdv.to(DGV.dtype.element_ty))
 
 
 
@@ -217,6 +217,10 @@ class FlashGRet_O(torch.autograd.Function):
         capability = torch.cuda.get_device_capability()
         if capability[0] < 8:
             raise RuntimeError("Flash attention currently only supported for compute capability >= 80")
+
+        A = A.contiguous()
+        v = v.contiguous()
+        gv = gv.contiguous()
 
         # assert gk.dtype == gv.dtype == torch.float32        
         # for now.
@@ -229,39 +233,35 @@ class FlashGRet_O(torch.autograd.Function):
 
         o = torch.zeros_like(v)
             
-
         _fwd_compute_O[grid](A, v, gv, o,
             A.stride(0), A.stride(1), A.stride(2), A.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             BLOCK_N=BLOCK_N, BLOCK_M=BLOCK_M, 
-            BLOCK_DMODEL_V=Lv
-        )
-    
+            BLOCK_DMODEL_V=Lv, num_warps=8, num_stages=4
+        )    
         ctx.save_for_backward(A, v, gv, o)
         ctx.grid = grid
+
         # ctx.BLOCK_N = BLOCK_N
         # ctx.BLOCK_DMODEL_QK = Lk
         # ctx.BLOCK_N = BLOCK_N
         # ctx.head = q.shape[1]
-        return o
-
-
+        return o.to(v.dtype)
 
     @staticmethod
     def backward(ctx, do):
         do = do.contiguous()
         A, v, gv, o = ctx.saved_tensors
 
-        dA = torch.empty_like(A)
+        dA = torch.zeros_like(A)
         dv = torch.zeros_like(v)
-        dgv = torch.empty_like(gv)
-                 
+        dgv = torch.zeros_like(gv)
+         
         # for now.
         BLOCK_M = BLOCK_N = v.shape[-2]
         # shape constraints
         Lv = v.shape[-1]
         
-
         _bwd_kernel_dav[ctx.grid](
             v, gv, A, o, 
             do, dA,
@@ -269,10 +269,13 @@ class FlashGRet_O(torch.autograd.Function):
             A.stride(0), A.stride(1), A.stride(2), A.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             BLOCK_N=BLOCK_N, BLOCK_M=BLOCK_M, 
-            BLOCK_DMODEL_V=Lv,
+            BLOCK_DMODEL_V=Lv, num_warps=8, num_stages=2
         )
         
-        return dA, dv, dgv
+
+        return dA, dv.to(dA), dgv.to(dA)
+
+
 
 
 
@@ -291,22 +294,21 @@ def compute_inner_o(qk, value, decay_value):
     return ((qk @ value) * decay_value).to(original_dtype)
 
 
-    
 
 if __name__ == "__main__":
     B = 32
-    H = 8
+    H = 4
     L = 2048
     D_QK = 256
     D_V = 512
     print("Hello.")
     
-
     requires_grad = True 
     chunk_size = 64
     num_chunk = L // chunk_size
 
-    dtype = torch.float32
+
+    dtype = torch.bfloat16
     A2 = torch.randn(B, H, num_chunk, chunk_size, chunk_size, device='cuda').to(dtype).exp()
 
     mask = torch.triu(torch.ones(chunk_size, chunk_size), diagonal=1).bool().to(A2.device)
@@ -315,8 +317,6 @@ if __name__ == "__main__":
 
     v = torch.rand(B, H, num_chunk, chunk_size, D_V, device='cuda').to(dtype).requires_grad_(requires_grad)
     gk = torch.randn(B, H, num_chunk, chunk_size, D_V, device='cuda').to(dtype).requires_grad_(requires_grad)
-
-
 
     # gv = torch.randn(B, H, L, D_V, device='cuda').requires_grad_(requires_grad)
     gk3 = F.logsigmoid(gk) / 8
@@ -354,13 +354,8 @@ if __name__ == "__main__":
     
     print( (o - o2).abs().max())
     
-
     for a, b in zip(grad1, grad2):
         print( (a  - b).abs().max())
-
-
-    breakpoint()
-
 
     for _ in range(200):
         o = FlashGRet_O.apply(A, v, gk3)
@@ -428,4 +423,3 @@ if __name__ == "__main__":
     # torch.cuda.synchronize()
     # end = time.time()
     # print(f"scan gret onc, time:{end - start}, fn:{compute_inner}")
-    
