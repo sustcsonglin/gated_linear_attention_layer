@@ -211,14 +211,16 @@ def inter_chunk_onc(query, key, value, gk, gv, chunk_size):
     decay_key_chunk = (gk[..., -1, :]).exp() 
     decay_value_chunk = (gv[..., -1, :]).exp() 
     to_add = (key * reduce_chunk_key).transpose(-1, -2) @ (value * reduce_chunk_value)
-    
-    
+        
     #### inter scan
-    memory_cache = Chunk_memory_update.apply(decay_key_chunk, decay_value_chunk, to_add)    
+    memory_cache = Chunk_memory_update.apply(decay_key_chunk, decay_value_chunk, to_add)
 
+    # memory_cache = to_add    
     ### inter contribution
     inter_chunk_contribution = ((query * gk.exp()) @ memory_cache) * gv.exp() 
+
     
+
     return rearrange(inter_chunk_contribution, 'b h n c d -> b h (n c) d')
 
 

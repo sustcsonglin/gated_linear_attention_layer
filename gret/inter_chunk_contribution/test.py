@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from einops import rearrange
 import time 
 import math
+from triton_onc.fused_inter_chunk_full import inter_chunk_onc_fused
 
 if __name__ == "__main__":
     B = 32
@@ -14,6 +15,7 @@ if __name__ == "__main__":
     D_QK = 256
     D_V = 512
     require_grad= False
+
 
     dtype = torch.bfloat16
     q = torch.rand(B, H, L, D_QK, device='cuda').to(dtype).requires_grad_(require_grad) / math.sqrt(256)
@@ -27,14 +29,14 @@ if __name__ == "__main__":
     gv = (F.logsigmoid(gv) / 32).requires_grad_(require_grad)
 
 
-    o = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 64)
-    o2 = compute_inter_chunk_on2(q, k, v, gk, gv, chunk_size = 64)
-
-    print( (o-o2).abs().max())
+    o = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 128)
+    # o2 = compute_inter_chunk_on2(q, k, v, gk, gv, chunk_size = 64)
+    o3 = inter_chunk_onc_fused(q, k, v, gk, gv, chunk_size = 128)
+    print((o-o3).abs().max())
 
     for _ in range(100):
-        o = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 64)
-        o2 = compute_inter_chunk_on2(q, k, v, gk, gv, chunk_size = 64)
+        o = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 128)
+        o3 = inter_chunk_onc_fused(q, k, v, gk, gv, chunk_size = 128)
     
     print("Warmup.")
 
@@ -43,7 +45,7 @@ if __name__ == "__main__":
     
 
     for _ in range(200):
-        o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 64)
+        o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 128)
         if require_grad:
             o2.sum().backward(retain_graph=True)    
         
@@ -51,17 +53,16 @@ if __name__ == "__main__":
     end = time.time()
     print(f"scan gret onc, time:{end - start}, ")      
     
-    
     torch.cuda.synchronize()
     start = time.time()
     
     for _ in range(200):
-        o2 = compute_inter_chunk_on2(q, k, v, gk, gv, chunk_size = 64)
+        o3 = inter_chunk_onc_fused(q, k, v, gk, gv, chunk_size = 128)
         if require_grad:
             o2.sum().backward(retain_graph=True)    
     torch.cuda.synchronize()
     end = time.time()
-    print(f"scan gret onc, time:{end - start},  ")      
+    print(f"scan gret onc fused, time:{end - start},  ")      
         
     print("warm up done.")
 
