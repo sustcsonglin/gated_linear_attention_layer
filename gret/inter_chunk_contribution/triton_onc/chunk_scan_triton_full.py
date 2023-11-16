@@ -26,7 +26,6 @@ def _fwd_recurrence(
     p2 = p2 + offset_bh * NUM_BLOCK * D_MODEL_V + tl.arange(0, BLOCK_MODEL) + offset_s * BLOCK_MODEL + D_MODEL_V  
 
     acc = tl.zeros([BLOCK_MODEL, BLOCK_MODEL], dtype=tl.float32)
-
     acc += tl.load(S)    
     
     S += D_MODEL_K * D_MODEL_V    
@@ -103,7 +102,8 @@ def _bwd_recurrence(
 
         tl.store(S, Dacc.to(S.dtype.element_ty))        
 
-        Dacc *= p_key[:, None] * p_value[None, :]
+        Dacc *= p_key[:, None]
+        Dacc *= p_value[None, :]
 
         S -= D_MODEL_K * D_MODEL_V 
         DS -= D_MODEL_K * D_MODEL_V 
@@ -121,12 +121,9 @@ class Chunk_memory_update(torch.autograd.Function):
         decay_value_last = decay_value_last.contiguous()
         to_add = to_add.contiguous()
 
-        
         B, H, N, D_k, D_v = to_add.shape 
-
         output = torch.empty_like(to_add)        
-
-        BLOCK_MODEL = 32
+        BLOCK_MODEL = 128
     
         assert D_k % 32 == 0
         assert D_v % 32 == 0
@@ -144,8 +141,10 @@ class Chunk_memory_update(torch.autograd.Function):
             output,
             D_MODEL_K=D_k, D_MODEL_V=D_v,
             NUM_BLOCK=N,  
-            BLOCK_MODEL=BLOCK_MODEL
+            BLOCK_MODEL=BLOCK_MODEL, num_warps=16, num_stages=8
         )
+    
+
         
         output[:, :, 0] = 0
         ctx.save_for_backward(output, decay_key_last, decay_value_last)        
@@ -178,7 +177,7 @@ class Chunk_memory_update(torch.autograd.Function):
             NUM_BLOCK = num_block, NUM_SPLIT_K = D_k // BLOCK_MODEL, NUM_SPLIT_V = D_v // BLOCK_MODEL, 
             D_MODEL_K = D_k,
             D_MODEL_V = D_v, 
-            BLOCK_MODEL = BLOCK_MODEL
+            BLOCK_MODEL = BLOCK_MODEL, num_warps=16, num_stages=4
         )
 
         output[:, :, -1] = 0
@@ -196,28 +195,30 @@ class Chunk_memory_update(torch.autograd.Function):
 def inter_chunk_onc(query, key, value, gk, gv, chunk_size):
     L = query.shape[-2]
     num_block = L // chunk_size
-    query = rearrange(query, 'b h (n c) d  -> b h n c d', c=chunk_size)
-    key = rearrange(key, 'b h (n c) d -> b h n c d', c=chunk_size)
-    value = rearrange(value, 'b h (n c) d -> b h n c d', c=chunk_size)
-    gk = rearrange(gk,  'b h (n c) d -> b h n c d', c=chunk_size)
-    gv = rearrange(gv,  'b h (n c) d -> b h n c d', c=chunk_size)
+    query = rearrange(query, 'b h (n c) d  -> b h n c d', c=chunk_size).contiguous()
+    key = rearrange(key, 'b h (n c) d -> b h n c d', c=chunk_size).contiguous()
+    value = rearrange(value, 'b h (n c) d -> b h n c d', c=chunk_size).contiguous()
+    gk = rearrange(gk,  'b h (n c) d -> b h n c d', c=chunk_size).contiguous()
+    gv = rearrange(gv,  'b h (n c) d -> b h n c d', c=chunk_size).contiguous()
 
     gk = gk.cumsum(-2)
     gv = gv.cumsum(-2)
 
+
     #### inter reduction
-    reduce_chunk_key = (gk[..., -1, None, :] -  gk).exp()
-    reduce_chunk_value = (gv[..., -1, None, :] -  gv).exp()
-    decay_key_chunk = (gk[..., -1, :]).exp()
-    decay_value_chunk = (gv[..., -1, :]).exp()
+    reduce_chunk_key = (gk[..., -1, None, :] -  gk).exp().to(key)
+    reduce_chunk_value = (gv[..., -1, None, :] -  gv).exp().to(key)
+    decay_key_chunk = (gk[..., -1, :]).exp() 
+    decay_value_chunk = (gv[..., -1, :]).exp() 
     to_add = (key * reduce_chunk_key).transpose(-1, -2) @ (value * reduce_chunk_value)
+    
     
     #### inter scan
     memory_cache = Chunk_memory_update.apply(decay_key_chunk, decay_value_chunk, to_add)    
 
     ### inter contribution
-    inter_chunk_contribution = ((query * gk.exp()) @ memory_cache) * gv.exp()
-        
+    inter_chunk_contribution = ((query * gk.exp()) @ memory_cache) * gv.exp() 
+    
     return rearrange(inter_chunk_contribution, 'b h n c d -> b h (n c) d')
 
 

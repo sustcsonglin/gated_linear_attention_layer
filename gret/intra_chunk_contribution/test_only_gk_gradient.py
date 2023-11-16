@@ -30,21 +30,19 @@ def compute_inner(query, key,  decay_key):
     return qk  
 
 
-
-
 if __name__ == "__main__":
     B = 8
     H = 4
     L = 2048
-    D_QK = 128
-    D_V = 256
-
+    D_QK = 256
+    D_V = 512
 
     requires_grad = True
     chunk_size = 64
     num_chunk = L // chunk_size
 
-    dtype = torch.float32
+
+    dtype = torch.bfloat16
     q = (torch.rand(B, H, num_chunk, chunk_size, D_QK, device='cuda').to(dtype)).requires_grad_(requires_grad)  
     k = torch.rand(B, H, num_chunk, chunk_size, D_QK, device='cuda').to(dtype).requires_grad_(requires_grad)
     v = torch.rand(B, H, num_chunk, chunk_size, D_V, device='cuda').to(dtype).requires_grad_(requires_grad)

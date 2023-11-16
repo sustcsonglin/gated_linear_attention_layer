@@ -44,39 +44,35 @@ def _fwd_kernel_compute_A(
     A_ptr = A + a_offset + (start_m) * stride_a3 + tl.arange(0, 16)[None, :] + tl.arange(0, 16)[:, None] * stride_a4 
 
     for q_high in range(16, hi, 16):
-
         q = tl.load(Q_ptr + q_high * stride_q4)
         q_gk = tl.load(GK_Q_ptr + q_high * stride_q4).to(tl.float32)
         q_normalizer = tl.load(GK + qk_offset + start_m * stride_q3 + q_high * stride_q4 + tl.arange(0,BLOCK_DMODEL_QK)).to(tl.float32)
-        q_gk2 = tl.exp(q_gk - q_normalizer[None, :])
+        q_gk2 = tl.math.exp(q_gk - q_normalizer[None, :])
         q = q * q_gk2.to(q.dtype)
 
         #inter-chunk bf16
         for k_high in range(0, q_high, 16):
             k = tl.load(K_ptr + k_high * stride_q4)
             k_gk = tl.load(GK_K_ptr + k_high * stride_q4).to(tl.float32)            
-            k_gk = tl.exp(q_normalizer[:, None] - k_gk)
+            k_gk = tl.math.exp(q_normalizer[:, None] - k_gk)
             k = k * k_gk.to(k.dtype)
             qk = tl.dot(q, k, allow_tf32=False)            
             tl.store(A_ptr + q_high * stride_a4 + k_high, qk.to(A_ptr.dtype.element_ty))    
 
-
-    ## intra chunk fp32
-    for q_high in range(lo, hi, 16):
-        q = tl.load(Q_ptr + q_high * stride_q4)
-        q_gk = tl.load(GK_Q_ptr + q_high * stride_q4).to(tl.float32)
-        q_normalizer = tl.load(GK + qk_offset + start_m * stride_q3 + q_high * stride_q4 + tl.arange(0,BLOCK_DMODEL_QK)).to(tl.float32)
-        q_gk2 = tl.exp(q_gk - q_normalizer[None, :])
-        q = q * q_gk2
-        q_gk3 = tl.exp(q_normalizer[None, :] - q_gk)
-        k = tl.load(K_ptr + q_high * stride_q4)
-        k = k * tl.trans(q_gk3)
-
-        qk = tl.dot(q, k, allow_tf32=False)
-        qk = tl.where(tl.arange(0, 16)[:, None]>=tl.arange(0, 16)[None, :], qk, 0.)
-        tl.store(A_ptr + q_high * stride_a4 + q_high, qk.to(A_ptr.dtype.element_ty))    
-
-
+    # numerical issue.... let's use cuda kernel.
+    # ## intra chunk fp32
+    # for q_high in range(lo, hi, 16):
+    #     q = tl.load(Q_ptr + q_high * stride_q4).to(tl.float32)
+    #     q_gk = tl.load(GK_Q_ptr + q_high * stride_q4).to(tl.float32)
+    #     q_normalizer = tl.load(GK + qk_offset + start_m * stride_q3 + q_high * stride_q4 + tl.arange(0,BLOCK_DMODEL_QK)).to(tl.float32)
+    #     q_gk2 = tl.math.exp(q_gk - q_normalizer[None, :])
+    #     q = q * q_gk2
+    #     q_gk3 = tl.math.exp(q_normalizer[None, :] - q_gk)
+    #     k = tl.load(K_ptr + q_high * stride_q4).to(tl.float32)
+    #     k = k * tl.trans(q_gk3)
+    #     qk = tl.dot(q, k, allow_tf32=False)
+    #     qk = tl.where(tl.arange(0, 16)[:, None]>=tl.arange(0, 16)[None, :], qk, 0.)
+    #     tl.store(A_ptr + q_high * stride_a4 + q_high, qk.to(A_ptr.dtype.element_ty))    
 
 
 @triton.jit
@@ -122,20 +118,20 @@ def _bwd_kernel_dqk(Q, K, GK, DA,
 
         dq2 = tl.zeros([16, BLOCK_DMODEL_QK], dtype=tl.float32)
 
+
         for k_high in range(0, q_high, 16):
             k = tl.load(K_ptr + k_high * stride_q4)
-            k_gk = tl.load(GK_K_ptr + k_high * stride_q4).to(tl.float32)            
+            k_gk = tl.load(GK_K_ptr + k_high * stride_q4)           
             dqk = tl.load(DA_ptr + q_high * stride_a4 + k_high)
-            k_gk = tl.exp(q_normalizer[None, :] - k_gk)
+            k_gk = tl.math.exp(q_normalizer[None, :] - k_gk)
             k = k * k_gk.to(k.dtype)
             dq2 += tl.dot(dqk, k, allow_tf32=False)
-                
-        dq2 = dq2.to(q.dtype)
-        q_gk = tl.load(GK_Q_ptr + q_high * stride_q4).to(tl.float32)
-        q_gk = tl.exp(q_gk - q_normalizer[None, :])
+    
+        q_gk = tl.load(GK_Q_ptr + q_high * stride_q4)
+        q_gk = tl.math.exp(q_gk - q_normalizer[None, :])
         dq = dq2 * q_gk.to(q.dtype) 
         dq_gk = dq * q
-                
+        
         DQ_ptr = DQ + qk_offset + (start_m) * stride_q3+ tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4 + q_high * stride_q4
         tl.store(DQ_ptr, dq.to(DQ_ptr.dtype.element_ty))
 
@@ -144,27 +140,25 @@ def _bwd_kernel_dqk(Q, K, GK, DA,
         tl.store(DGK_Q_ptr, dq_gk.to(DGK_Q_ptr.dtype.element_ty))
 
     tl.debug_barrier()
-        
+    
     for k_high in range(lo, hi-16, 16):
-        k = tl.load(K_ptr + k_high * stride_q4)
         k_gk = tl.load(GK_K_ptr + k_high * stride_q4)
         dk = tl.zeros([16, BLOCK_DMODEL_QK], dtype=tl.float32)
-        dgk = tl.zeros([16, BLOCK_DMODEL_QK], dtype=tl.float32)
 
         for q_high in range(k_high+16, hi, 16):
             q = tl.load(Q_ptr + q_high * stride_q4) 
             q_normalizer = tl.load(GK + qk_offset + (start_m * stride_q3)+ q_high * stride_q4 + tl.arange(0,
             BLOCK_DMODEL_QK)).to(tl.float32)
             q_gk = tl.load(GK_Q_ptr + q_high * stride_q4).to(tl.float32)
-            q_gk = tl.exp(q_gk - q_normalizer[None, :]).to(q.dtype)
+            q_gk = tl.math.exp(q_gk - q_normalizer[None, :]).to(q.dtype)
             q = q * q_gk
             dqk = tl.load(DA_ptr + q_high * stride_a4 + k_high)
 
-            k_gk2 = tl.exp(q_normalizer[None, :] - k_gk)
+            k_gk2 = tl.math.exp(q_normalizer[None, :] - k_gk)
             
             dk2 = tl.dot(tl.trans(dqk), q, allow_tf32=False)
             dk += dk2 * k_gk2
-            dgk -= dk2 * k * k_gk2
+            # dgk -= dk2 * k * k_gk2
 
 
         DK_ptr = DK + qk_offset + (start_m) * stride_q3+ tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4 + k_high * stride_q4
@@ -172,51 +166,47 @@ def _bwd_kernel_dqk(Q, K, GK, DA,
 
         DGK_K_ptr = DGK + qk_offset + (start_m) * stride_q3+ tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4 + k_high * stride_q4
         prev = tl.load(DGK_K_ptr)
-        tl.store(DGK_K_ptr,  (prev + dgk).to(DGK_K_ptr.dtype.element_ty))
-
-    tl.debug_barrier()
-
-    DK_ptr = DK + qk_offset + (start_m) * stride_q3 + tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4
-
-    DGK_K_ptr = DGK + qk_offset + (start_m) * stride_q3 + tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4
-
-    DQ_ptr = DQ + qk_offset + (start_m) * stride_q3 + tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4
-
-    ## intra chunk, fp32.
-    for q_high in range(lo, hi, 16):
-        q = tl.load(Q_ptr + q_high * stride_q4)
-        q_gk = tl.load(GK_Q_ptr + q_high * stride_q4).to(tl.float32)
-        q_normalizer = tl.load(GK + qk_offset + start_m * stride_q3 + q_high * stride_q4 + tl.arange(0,BLOCK_DMODEL_QK)).to(tl.float32)
-        q_gk2 = tl.exp(q_gk - q_normalizer[None, :])
-        q2 = q * q_gk2
-        q_gk3 = tl.exp(q_normalizer[None, :] - q_gk)
-
-        k = tl.load(K_ptr + q_high * stride_q4)
-        k2 = k * q_gk3
-
-        dqk = tl.load(DA_ptr + q_high * stride_a4 + q_high)
-        dqk = tl.where(tl.arange(0, 16)[:, None]>=tl.arange(0, 16)[None, :], dqk, 0.)
-
-        dk2 = tl.dot(tl.trans(dqk), q2, allow_tf32=False)        
-        dk = dk2 * q_gk3
-        prev_dk = tl.load(DK_ptr + q_high * stride_q4)
-        tl.store(DK_ptr + q_high * stride_q4, (dk + prev_dk).to(DK_ptr.dtype.element_ty))
-
-        dgk = - dk * k
-        dq2 = tl.dot(dqk, k2, allow_tf32=False)
-        dq = dq2 * q_gk2
-
-        prev_dq = tl.load(DQ_ptr + q_high * stride_q4)
-        tl.store(DQ_ptr + q_high * stride_q4, (dq + prev_dq).to(DQ_ptr.dtype.element_ty))
-
-        dgk += dq * q
-        prev_dq_gk = tl.load(DGK_K_ptr + q_high * stride_q4)
-        tl.store(DGK_K_ptr + q_high * stride_q4, (dgk + prev_dq_gk).to(DGK_K_ptr.dtype.element_ty))
-        
+        k = tl.load(K_ptr + k_high * stride_q4)
+        tl.store(DGK_K_ptr,  (prev - dk * k).to(DGK_K_ptr.dtype.element_ty))
 
 
+    # tl.debug_barrier()
+    # DK_ptr = DK + qk_offset + (start_m) * stride_q3 + tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4
 
+    # DGK_K_ptr = DGK + qk_offset + (start_m) * stride_q3 + tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4
 
+    # DQ_ptr = DQ + qk_offset + (start_m) * stride_q3 + tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4
+
+    # ## intra chunk, fp32.
+    # for q_high in range(lo, hi, 16):
+    #     q = tl.load(Q_ptr + q_high * stride_q4)
+    #     q_gk = tl.load(GK_Q_ptr + q_high * stride_q4).to(tl.float32)
+    #     q_normalizer = tl.load(GK + qk_offset + start_m * stride_q3 + q_high * stride_q4 + tl.arange(0,BLOCK_DMODEL_QK)).to(tl.float32)
+    #     q_gk2 = tl.math.exp(q_gk - q_normalizer[None, :])
+    #     q2 = q * q_gk2
+    #     q_gk3 = tl.math.exp(q_normalizer[None, :] - q_gk)
+
+    #     k = tl.load(K_ptr + q_high * stride_q4)
+    #     k2 = k * q_gk3
+
+    #     dqk = tl.load(DA_ptr + q_high * stride_a4 + q_high)
+    #     dqk = tl.where(tl.arange(0, 16)[:, None]>=tl.arange(0, 16)[None, :], dqk, 0.)
+
+    #     dk2 = tl.dot(tl.trans(dqk), q2, allow_tf32=False)        
+    #     dk = dk2 * q_gk3
+    #     prev_dk = tl.load(DK_ptr + q_high * stride_q4)
+    #     tl.store(DK_ptr + q_high * stride_q4, (dk + prev_dk).to(DK_ptr.dtype.element_ty))
+
+    #     dgk = - dk * k
+    #     dq2 = tl.dot(dqk, k2, allow_tf32=False)
+    #     dq = dq2 * q_gk2
+
+    #     prev_dq = tl.load(DQ_ptr + q_high * stride_q4)
+    #     tl.store(DQ_ptr + q_high * stride_q4, (dq + prev_dq).to(DQ_ptr.dtype.element_ty))
+
+    #     dgk += dq * q
+    #     prev_dq_gk = tl.load(DGK_K_ptr + q_high * stride_q4)
+    #     tl.store(DGK_K_ptr + q_high * stride_q4, (dgk + prev_dq_gk).to(DGK_K_ptr.dtype.element_ty))
 
 
 def compute_inner(query, key, value, decay_key):
@@ -263,6 +253,10 @@ def compute_inner_A(query, key, decay_key):
 class FlashGRet(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, gk):
+        q = q.contiguous()
+        k = k.contiguous()
+        gk = gk.contiguous()
+
         # only support for Ampere now
         capability = torch.cuda.get_device_capability()
         if capability[0] < 8:
@@ -276,12 +270,10 @@ class FlashGRet(torch.autograd.Function):
         Lq, Lk = q.shape[-1], k.shape[-1]
 
         A = torch.zeros(q.shape[0], q.shape[1], q.shape[2], BLOCK_N, BLOCK_N, device=q.device, dtype=q.dtype)        
-            
+        
+        grid = (q.shape[2] , q.shape[0] * q.shape[1], 1)     
 
-        grid = (q.shape[2] , q.shape[0] * q.shape[1], 1)
-            
-        # assert q.dtype == k.dtype == v.dtype  
-
+        # assert q.dtype == k.dtype == v.dtype                  
         _fwd_kernel_compute_A[grid](
             q, k, gk, A,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -289,6 +281,7 @@ class FlashGRet(torch.autograd.Function):
             q.shape[0], q.shape[1], q.shape[2], q.shape[3],            
             BLOCK_N=BLOCK_N, BLOCK_DMODEL_QK=Lk, BLOCK_M=BLOCK_M, num_warps=8, num_stages=8
         )
+        
 
         ctx.save_for_backward(q, k, gk)
         ctx.grid = grid
@@ -304,9 +297,9 @@ class FlashGRet(torch.autograd.Function):
         dA = dA.contiguous()
         q, k, gk = ctx.saved_tensors
 
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dgk = torch.empty_like(gk)
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dgk = torch.zeros_like(gk)
          
         BLOCK_N = ctx.BLOCK_N
         # for now.
@@ -345,8 +338,7 @@ if __name__ == "__main__":
     chunk_size = 64
     num_chunk = L // chunk_size
 
-
-    dtype = torch.float32
+    dtype = torch.bfloat16
     q = (torch.rand(B, H, num_chunk, chunk_size, D_QK, device='cuda').to(dtype)).requires_grad_(requires_grad)  
     k = torch.rand(B, H, num_chunk, chunk_size, D_QK, device='cuda').to(dtype).requires_grad_(requires_grad)
     v = torch.rand(B, H, num_chunk, chunk_size, D_V, device='cuda').to(dtype).requires_grad_(requires_grad)
@@ -354,7 +346,7 @@ if __name__ == "__main__":
 
     # gv = torch.randn(B, H, L, D_V, device='cuda').requires_grad_(requires_grad)
     gk3 = F.logsigmoid(gk) / 8
-
+    gk3 = gk3.cumsum(-2)
 
     # gv3 = F.logsigmoid(gv) / 16
     # gk3 = gk3.clamp(min=-5)
@@ -379,7 +371,6 @@ if __name__ == "__main__":
         if requires_grad:
             o2.sum().backward(retain_graph=True)    
 
-        breakpoint()
 
     print("warm up done.")
     print(o-o2)
@@ -441,4 +432,5 @@ if __name__ == "__main__":
     # torch.cuda.synchronize()
     # end = time.time()
     # print(f"scan gret onc, time:{end - start}, fn:{compute_inner}")    
-    
+
+

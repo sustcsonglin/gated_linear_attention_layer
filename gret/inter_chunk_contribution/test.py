@@ -1,64 +1,98 @@
-from triton_on2.full import flash_gret_full
+from triton_on2.full_no_fuse import compute_inter_chunk_on2
 from triton_onc.chunk_scan_triton_full import inter_chunk_onc
 from triton_on2.naive import naive
 import torch 
 import torch.nn.functional as F
 from einops import rearrange
 import time 
+import math
 
 if __name__ == "__main__":
-    B = 2
-    H = 1
+    B = 32
+    H = 8
     L = 2048
-    D_QK = 1024
-    D_V = 2048
-
+    D_QK = 256
+    D_V = 512
+    require_grad= False
 
     dtype = torch.bfloat16
-    q = torch.rand(B, H, L, D_QK, device='cuda').to(dtype)
-    k = torch.rand(B, H, L, D_QK, device='cuda').to(dtype)
-    v = torch.rand(B, H, L, D_V, device='cuda').to(dtype)
+    q = torch.rand(B, H, L, D_QK, device='cuda').to(dtype).requires_grad_(require_grad) / math.sqrt(256)
+    k = torch.rand(B, H, L, D_QK, device='cuda').to(dtype).requires_grad_(require_grad)
+    v = torch.rand(B, H, L, D_V, device='cuda').to(dtype).requires_grad_(require_grad)
     gk = torch.randn(B, H, L, D_QK, device='cuda').to(dtype)
     gv = torch.randn(B, H, L, D_V, device='cuda').to(dtype)
 
-    gk = (F.logsigmoid(gk) / 16) 
-    gv = (F.logsigmoid(gv) / 16) 
+
+    gk = (F.logsigmoid(gk) / 32).requires_grad_(require_grad)
+    gv = (F.logsigmoid(gv) / 32).requires_grad_(require_grad)
+
+
+    o = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 64)
+    o2 = compute_inter_chunk_on2(q, k, v, gk, gv, chunk_size = 64)
+
+    print( (o-o2).abs().max())
 
     for _ in range(100):
-        # o = naive(q, k, v, gk, gv, BLOCK_N = 64)
-        o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 64)
-        o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 16)
-        o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 32)
-        o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 128)
-        o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 256)
-        # o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 512)
-        # o3 = flash_gret_full(q, k, v, gk, gv, BLOCK_N = 64)
+        o = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 64)
+        o2 = compute_inter_chunk_on2(q, k, v, gk, gv, chunk_size = 64)
     
+    print("Warmup.")
+
+    torch.cuda.synchronize()
+    start = time.time()
+    
+
+    for _ in range(200):
+        o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = 64)
+        if require_grad:
+            o2.sum().backward(retain_graph=True)    
+        
+    torch.cuda.synchronize()
+    end = time.time()
+    print(f"scan gret onc, time:{end - start}, ")      
+    
+    
+    torch.cuda.synchronize()
+    start = time.time()
+    
+    for _ in range(200):
+        o2 = compute_inter_chunk_on2(q, k, v, gk, gv, chunk_size = 64)
+        if require_grad:
+            o2.sum().backward(retain_graph=True)    
+    torch.cuda.synchronize()
+    end = time.time()
+    print(f"scan gret onc, time:{end - start},  ")      
+        
     print("warm up done.")
 
-    for chunk_size in [16, 32, 64, 128, 256, 512]:
+
+    for chunk_size in [32, 64, 128, 256, 512, 1024, 2048]:
         torch.cuda.synchronize()
-        start = time.time()
-        
-        for _ in range(1000):
+        start = time.time()    
+        for _ in range(200):
             o2 = inter_chunk_onc(q, k, v, gk, gv, chunk_size = chunk_size)
-            # if requires_grad:
-            #     output2.sum().backward(retain_graph=True)    
+            if require_grad:
+                o2.sum().backward(retain_graph=True)    
         torch.cuda.synchronize()
         end = time.time()
-        print(f"scan gret onc, time:{end - start},  chunk size: {chunk_size}")
+        print(f"scan gret onc, time:{end - start},  chunk size: {chunk_size}")      
+    torch.cuda.synchronize()
+    start = time.time()
+    torch.cuda.synchronize()
+    start = time.time()
+
+
+    for _ in range(200):
+        o = (q @ k.transpose(-1, -2)) @ v
+        # if requires_grad:
+        #     output2.sum().backward(retain_graph=True)    
+    torch.cuda.synchronize()
+    end = time.time()
+    print("flash gret on2, require_grad:{}", end - start)
 
 
 
-    # torch.cuda.synchronize()
-    # start = time.time()
-    # for _ in range(1000):
-    #     o3 = flash_gret_full(q, k, v, gk, gv, BLOCK_N = 128)
-    #     # if requires_grad:
-    #     #     output2.sum().backward(retain_graph=True)    
-    # torch.cuda.synchronize()
-    # end = time.time()
-    # print("flash gret on2, require_grad:{}", end - start)
+
 
 
 
