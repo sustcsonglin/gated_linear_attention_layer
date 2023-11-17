@@ -15,6 +15,7 @@ import numpy as np
 import math
 
 
+
 @triton.jit
 def _fwd_compute_O(
     A, V, GV, O, 
@@ -26,25 +27,23 @@ def _fwd_compute_O(
     off_hz = tl.program_id(1)
     a_offset = off_hz * stride_a2
     v_offset = off_hz * stride_v2
-    
+    off_v = tl.program_id(2)
+
     lo = 0
     hi = BLOCK_N 
 
-    V_ptr = V + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
+    V_ptr = V + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4 + off_v * BLOCK_DMODEL_V
 
-    O_ptr = O + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
+    O_ptr = O + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4 + off_v * BLOCK_DMODEL_V
 
-    GV_ptr = GV + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
+    GV_ptr = GV + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4 + off_v * BLOCK_DMODEL_V
 
     A_ptr = A + a_offset + (start_m) * stride_a3 + tl.arange(0, 16)[None, :] + tl.arange(0, 16)[:, None] * stride_a4 
-
+    
     for q_high in range(lo+16, hi, 16):
-        q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
+        q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V) + off_v * BLOCK_DMODEL_V).to(tl.float32)
         acc = tl.zeros([16, BLOCK_DMODEL_V], dtype=tl.float32)
         
-        # k_gv = tl.load(GV_ptr + q_high * stride_v4)
-        # q_gv = tl.exp(k_gv - q_gv_normalizer[None, :])
-
         for k_high in range(0, q_high, 16):            
             qk = tl.load(A_ptr + q_high * stride_a4 + k_high)                    
             v = tl.load(V_ptr + k_high * stride_v4)
@@ -60,7 +59,7 @@ def _fwd_compute_O(
     tl.debug_barrier()
     
     for q_high in range(lo, hi, 16):
-        q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
+        q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V) + off_v * BLOCK_DMODEL_V).to(tl.float32)
 
         qk = tl.load(A_ptr + q_high * stride_a4 + q_high)                            
         v = tl.load(V_ptr + q_high * stride_v4)
@@ -85,55 +84,60 @@ def _bwd_kernel_dav(V, GV, A, O,
                 DO, DA,
                 DV, DGV, 
                 stride_a1, stride_a2, stride_a3, stride_a4,
-                stride_v1, stride_v2, stride_v3, stride_v4,
+                stride_da1, stride_da2, stride_da3, stride_da4, stride_da5, 
+                stride_v1, stride_v2, stride_v3, stride_v4, 
                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DMODEL_V: tl.constexpr
                 ):
     
-
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
+    offset_v = tl.program_id(2)
 
-    a_offset = off_hz * stride_a2
-    v_offset = off_hz * stride_v2
+    a_offset = off_hz * stride_a2 + (start_m) * stride_a3
+
+    da_offset = off_hz * stride_da2 + start_m * stride_da4 + offset_v * stride_da3 
+
+    v_offset = off_hz * stride_v2 + offset_v * BLOCK_DMODEL_V + (start_m) * stride_v3
 
     lo = 0
     hi = BLOCK_N 
+
+    DO_ptr = DO + v_offset + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4 
+
+    O_ptr = O + v_offset  + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4 
     
-    DO_ptr = DO + v_offset + (start_m ) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
+    DV_ptr = DV + v_offset + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
 
-    O_ptr = O + v_offset + (start_m ) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
-    
-    DV_ptr = DV + v_offset + (start_m ) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
+    GV_ptr = GV + v_offset + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
 
-    GV_ptr = GV + v_offset + (start_m ) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
+    DGV_ptr = DGV + v_offset + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4 
 
-    DGV_ptr = DGV + v_offset + (start_m ) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[:, None] * stride_v4
+    A_ptr = A + a_offset + tl.arange(0, 16)[None, :] + tl.arange(0, 16)[:, None] * stride_a4
 
-    A_ptr = A + a_offset + (start_m ) * stride_a3 + tl.arange(0, 16)[None, :] + tl.arange(0, 16)[:, None] * stride_a4
-
-    DA_ptr = DA + a_offset + (start_m ) * stride_a3 + tl.arange(0, 16)[None, :] + tl.arange(0, 16)[:, None] * stride_a4
+    DA_ptr = DA + da_offset + tl.arange(0, 16)[None, :] + tl.arange(0, 16)[:, None] * stride_da5 
 
     # pre-compute do*q_gv. in-place update
+    # no synchronization need.
+
     for q_high in range(lo, hi, 16):
         do = tl.load(DO_ptr + q_high * stride_v4)    
         o = tl.load(O_ptr + q_high * stride_v4)
-        tl.store(DGV_ptr + q_high * stride_v4, (do * o))        
-        
-        q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
+        tl.store(DGV_ptr + q_high * stride_v4, (do * o))                
+        q_gv_normalizer = tl.load(GV + v_offset +  tl.arange(0, BLOCK_DMODEL_V) + q_high * stride_v4).to(tl.float32)
         q_gv = tl.load(GV_ptr + q_high * stride_v4)
         q_gv = tl.exp(q_gv - q_gv_normalizer[None, :])
-        do = do * q_gv
-
+        do = do * q_gv        
         tl.store(DO_ptr + q_high * stride_v4, do)
         
     tl.debug_barrier()
 
-    V_ptr = V + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[:, None] + tl.arange(0, 16)[None, :] * stride_v4
-    GV_ptr = GV + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[:, None] + tl.arange(0, 16)[None, :] * stride_v4
+    V_ptr = V + v_offset + tl.arange(0, BLOCK_DMODEL_V)[:, None] + tl.arange(0, 16)[None, :] * stride_v4 
+
+    GV_ptr = GV + v_offset + tl.arange(0, BLOCK_DMODEL_V)[:, None] + tl.arange(0, 16)[None, :] * stride_v4
 
     for q_high in range(lo+16, hi, 16):
         do = tl.load(DO_ptr + q_high * stride_v4)            
-        q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, 
+        q_gv_normalizer = tl.load(GV + v_offset  + q_high * stride_v4 + tl.arange(0, 
         BLOCK_DMODEL_V)).to(tl.float32)
         
         for k_high in range(0, q_high, 16):
@@ -144,27 +148,27 @@ def _bwd_kernel_dav(V, GV, A, O,
             # bf16
             v2 = v * k_gv.to(v.dtype)            
             dqk = tl.dot(do, v2, allow_tf32=False)                        
-            tl.store(DA_ptr + q_high * stride_a4 + k_high, dqk.to(DA.dtype.element_ty))          
+
+            # need synchronization
+            tl.store(DA_ptr + q_high * stride_da5 + k_high, dqk.to(DA.dtype.element_ty))          
     
+
     tl.debug_barrier()
 
-    A_ptr = A + a_offset + (start_m) * stride_a3 + tl.arange(0, 16)[:, None] + tl.arange(0, 16)[ None, :] * stride_a4
+    A_ptr = A + a_offset + tl.arange(0, 16)[:, None] + tl.arange(0, 16)[ None, :] * stride_a4
 
-    V_ptr = V + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[ :, None] * stride_v4
-    GV_ptr = GV + v_offset + (start_m) * stride_v3 + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[ :, None] * stride_v4
+    V_ptr = V + v_offset + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[ :, None] * stride_v4
+    GV_ptr = GV + v_offset + tl.arange(0, BLOCK_DMODEL_V)[None, :] + tl.arange(0, 16)[ :, None] * stride_v4
 
 
     for k_high in range(0, hi, 16):        
         dv = tl.zeros([16, BLOCK_DMODEL_V], dtype=tl.float32)
-
         k_gv = tl.load(GV_ptr + k_high * stride_v4)
 
         for q_high in range(k_high + 16, BLOCK_N, 16):
             do = tl.load(DO_ptr + q_high * stride_v4)                        
-
             kq = tl.load(A_ptr + q_high * stride_a4 + k_high)            
-
-            q_gv_normalizer = tl.load(GV + v_offset + (start_m) * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
+            q_gv_normalizer = tl.load(GV + v_offset + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
             k_gv2 = tl.exp(q_gv_normalizer[None, :] - k_gv)            
 
             # bf16
@@ -180,14 +184,13 @@ def _bwd_kernel_dav(V, GV, A, O,
 
     tl.debug_barrier()
 
-    A_ptr = A + a_offset + (start_m  ) * stride_a3 + tl.arange(0, 16)[:, None] + tl.arange(0, 16)[ None, :] * stride_a4 
-
+    A_ptr = A + a_offset + tl.arange(0, 16)[:, None] + tl.arange(0, 16)[ None, :] * stride_a4 
 
     #intra-chunk
     for q_high in range(lo, hi, 16):
         do = tl.load(DO_ptr + q_high * stride_v4)            
 
-        q_gv_normalizer = tl.load(GV + v_offset + start_m * stride_v3 + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
+        q_gv_normalizer = tl.load(GV + v_offset + q_high * stride_v4 + tl.arange(0, BLOCK_DMODEL_V)).to(tl.float32)
 
         v = tl.load(V_ptr + q_high * stride_v4)
         k_gv = tl.load(GV_ptr + q_high * stride_v4)
@@ -195,7 +198,7 @@ def _bwd_kernel_dav(V, GV, A, O,
         v2 = v * k_gv
 
         dqk = tl.dot(do.to(v2.dtype), tl.trans(v2), allow_tf32=False)
-        tl.store(DA_ptr + q_high * stride_a4 + q_high, dqk.to(DA_ptr.dtype.element_ty))
+        tl.store(DA_ptr + q_high * stride_da5 + q_high, dqk.to(DA_ptr.dtype.element_ty))
 
         kq = tl.load(A_ptr + q_high * stride_a4 + q_high)
         dv2 = tl.dot(kq, do, allow_tf32=False)
@@ -207,7 +210,6 @@ def _bwd_kernel_dav(V, GV, A, O,
         prev_gdv = tl.load(DGV_ptr + q_high * stride_v4)
         prev_gdv -= dv * v 
         tl.store(DGV_ptr + q_high * stride_v4, prev_gdv.to(DGV.dtype.element_ty))
-
 
 
 class FlashGRet_O(torch.autograd.Function):
@@ -224,17 +226,18 @@ class FlashGRet_O(torch.autograd.Function):
 
         # shape constraints
         Lv = v.shape[-1]
+        BLOCK_V = 128
+        assert v.shape[-1] % BLOCK_V == 0
             
-        grid = (v.shape[2] , v.shape[0] * v.shape[1], 1)
 
-        o = torch.zeros_like(v)
-            
+        grid = (v.shape[2] , v.shape[0] * v.shape[1],  v.shape[-1] // BLOCK_V)
+        o = torch.zeros_like(v)            
 
         _fwd_compute_O[grid](A, v, gv, o,
             A.stride(0), A.stride(1), A.stride(2), A.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             BLOCK_N=BLOCK_N, BLOCK_M=BLOCK_M, 
-            BLOCK_DMODEL_V=Lv
+            BLOCK_DMODEL_V=BLOCK_V
         )
     
         ctx.save_for_backward(A, v, gv, o)
@@ -252,7 +255,10 @@ class FlashGRet_O(torch.autograd.Function):
         do = do.contiguous()
         A, v, gv, o = ctx.saved_tensors
 
-        dA = torch.empty_like(A)
+        BLOCK_V = 128
+        assert v.shape[-1] % BLOCK_V == 0
+
+        # dA = torch.empty_like(A)
         dv = torch.zeros_like(v)
         dgv = torch.empty_like(gv)
                  
@@ -260,19 +266,26 @@ class FlashGRet_O(torch.autograd.Function):
         BLOCK_M = BLOCK_N = v.shape[-2]
         # shape constraints
         Lv = v.shape[-1]
-        
+        grid = (v.shape[2] , v.shape[0] * v.shape[1],  v.shape[-1] // BLOCK_V)
 
-        _bwd_kernel_dav[ctx.grid](
+        dA = torch.zeros(A.shape[0], A.shape[1], v.shape[-1] // BLOCK_V, A.shape[2], A.shape[3], A.shape[3], device=A.device, dtype=A.dtype)
+
+        # memory_format=torch.contiguous_format)
+                
+
+        _bwd_kernel_dav[grid](
             v, gv, A, o, 
             do, dA,
             dv, dgv,
             A.stride(0), A.stride(1), A.stride(2), A.stride(3),
+            dA.stride(0), dA.stride(1), dA.stride(2), dA.stride(3), dA.stride(4),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             BLOCK_N=BLOCK_N, BLOCK_M=BLOCK_M, 
-            BLOCK_DMODEL_V=Lv,
+            BLOCK_DMODEL_V=BLOCK_V,
         )
-        
-        return dA, dv, dgv
+
+        return dA.sum(2), dv, dgv
+
 
 
 
@@ -298,16 +311,16 @@ if __name__ == "__main__":
     H = 8
     L = 2048
     D_QK = 256
-    D_V = 512
+    D_V = 256
     print("Hello.")
     
-
     requires_grad = True 
     chunk_size = 64
     num_chunk = L // chunk_size
 
     dtype = torch.float32
     A2 = torch.randn(B, H, num_chunk, chunk_size, chunk_size, device='cuda').to(dtype).exp()
+
 
     mask = torch.triu(torch.ones(chunk_size, chunk_size), diagonal=1).bool().to(A2.device)
     A2.requires_grad_(requires_grad)
