@@ -22,11 +22,13 @@ def compute_inter_chunk_on2(q, k, v, gk, gv, chunk_size):
 
     gk = gk.cumsum(-2)
     gv = gv.cumsum(-2)
-
-    A = InterChunk_Compute_qk.apply(q, k, gk, 64, 32)
-    O = InterChunk_Compute_O.apply(A, v, gv, 64, 32)        
-
+    A = InterChunk_Compute_qk.apply(q, k, gk, 128, 32)
+    O = InterChunk_Compute_O.apply(A, v, gv, 128, 32)        
+    
     return O 
+
+
+
 
 
 

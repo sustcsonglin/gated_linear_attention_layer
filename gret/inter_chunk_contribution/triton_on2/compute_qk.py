@@ -68,6 +68,7 @@ def _fwd_kernel(
         A_ptr += BLOCK_K 
         K_trans_ptr += BLOCK_K * stride_q3
         GK_trans_ptr += BLOCK_K * stride_q3
+
     
         
 class InterChunk_Compute_qk(torch.autograd.Function):

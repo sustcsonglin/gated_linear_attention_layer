@@ -160,10 +160,10 @@ class Chunk_memory_update(torch.autograd.Function):
         B, H, N, D_k, D_v = output.shape 
 
         num_block = N
+        
+        BLOCK_MODEL = 32 
 
-        grid = ctx.grid 
-        BLOCK_MODEL = ctx.BLOCK_MODEL 
-
+        grid = (B*H, D_k//BLOCK_MODEL, D_v//BLOCK_MODEL)
 
         # I don't want atomic_add to be used in the backward pass
         # so I add another dimension to the output tensor (D_k/v // BLOCK_MODEL)
@@ -177,8 +177,9 @@ class Chunk_memory_update(torch.autograd.Function):
             NUM_BLOCK = num_block, NUM_SPLIT_K = D_k // BLOCK_MODEL, NUM_SPLIT_V = D_v // BLOCK_MODEL, 
             D_MODEL_K = D_k,
             D_MODEL_V = D_v, 
-            BLOCK_MODEL = BLOCK_MODEL, num_warps=16, num_stages=4
+            BLOCK_MODEL = BLOCK_MODEL
         )
+
 
         output[:, :, -1] = 0
         D_p1[:, :, 0] = 0
@@ -203,6 +204,7 @@ def inter_chunk_onc(query, key, value, gk, gv, chunk_size):
 
     gk = gk.cumsum(-2)
     gv = gv.cumsum(-2)
+
 
 
     #### inter reduction

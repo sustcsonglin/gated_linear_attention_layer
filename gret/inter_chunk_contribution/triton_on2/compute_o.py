@@ -30,8 +30,9 @@ def _fwd_kernel(
         return 
 
     off_hz = tl.program_id(1)
+    off_v = tl.program_id(2)
     a_offset = off_hz * stride_a2
-    v_offset = off_hz * stride_v2
+    v_offset = off_hz * stride_v2 + off_v * BLOCK_DMODEL_V
 
     # initialize pointer to m and l
     acc = tl.zeros([BLOCK_O, BLOCK_DMODEL_V], dtype=tl.float32)
@@ -81,17 +82,19 @@ class InterChunk_Compute_O(torch.autograd.Function):
 
         # for now.
         o = torch.zeros_like(v) 
+        BLOCK_SPLIT_V = 64
         # num_chunk: 
-        grid = (triton.cdiv(v.shape[2], BLOCK_O), v.shape[0] * v.shape[1], 1)
+        grid = (triton.cdiv(v.shape[2], BLOCK_O), v.shape[0] * v.shape[1], v.shape[-1] // BLOCK_SPLIT_V)
 
         # assert q.dtype == k.dtype == v.dtype == torch.bfloat16
-        
+
+
         _fwd_kernel[grid](
             A, v, gv, o,
             A.stride(0), A.stride(1), A.stride(2), A.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             BLOCK_O=BLOCK_O, BLOCK_V=BLOCK_V,
-            BLOCK_DMODEL_V=v.shape[-1],  num_warps=16, num_stages=8
+            BLOCK_DMODEL_V=BLOCK_SPLIT_V,  num_warps=16, num_stages=8
         )
         ctx.save_for_backward(A, v, gv, o)
         ctx.grid = grid
