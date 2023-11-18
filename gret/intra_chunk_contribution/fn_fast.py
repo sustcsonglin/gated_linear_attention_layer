@@ -15,8 +15,7 @@ import triton.language as tl
 
 import numpy as np
 import math
-from triton_chunk16x.fn_only_gk import FlashGRet
-from triton_chunk16x.fn_only_gv import FlashGRet_O
+from triton_chunk16x.fn_only_gk_fast import FlashGRet_faster 
 from triton_chunk16x.fn_only_gv_fast import FlashGRet_O_Faster
 
 
@@ -24,11 +23,11 @@ def intra_chunk_computation_pure_triton(q, k, v, gk, gv, chunk_size=None):
     # if chunk_size is not None, we need manually chunk the input into multiple chunks.
     # if is None, meaning that the input is already chunked.
     if chunk_size is not None:
-        q = rearrange(q, 'b h (n c) d  -> b h n c d', c=chunk_size)
-        k = rearrange(k, 'b h (n c) d -> b h n c d', c=chunk_size)
-        v = rearrange(v, 'b h (n c) d -> b h n c d', c=chunk_size)
-        gk = rearrange(gk, 'b h (n c) d -> b h n c d', c=chunk_size)
-        gv = rearrange(gv, 'b h (n c) d -> b h n c d', c=chunk_size)
+        q = rearrange(q, 'b h (n c) d  -> b h n c d', c=chunk_size).contiguous()
+        k = rearrange(k, 'b h (n c) d -> b h n c d', c=chunk_size).contiguous()
+        v = rearrange(v, 'b h (n c) d -> b h n c d', c=chunk_size).contiguous()
+        gk = rearrange(gk, 'b h (n c) d -> b h n c d', c=chunk_size).contiguous()
+        gv = rearrange(gv, 'b h (n c) d -> b h n c d', c=chunk_size).contiguous()
 
     chunk_size = v.shape[-2]
 
@@ -36,11 +35,22 @@ def intra_chunk_computation_pure_triton(q, k, v, gk, gv, chunk_size=None):
 
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1)
     multiple = chunk_size // 16    
+
+    gk = gk.cumsum(-2)
+    gv = gv.cumsum(-2)
+
+    reduced_gk = (gk[..., -1, None, :] - gk).exp()
+    reduced_gv = (gv[..., -1, None, :] - gv).exp()
+
+    k = k * reduced_gk
+    v = v * reduced_gv
+
     A = FlashGRet.apply(q, k, gk)
     
     # A = q @ k.transpose(-1, -2)
     # A = A.masked_fill_(mask, 0)
     # return A @ v 
+
 
     inner_chunk_contribution = FlashGRet_O.apply(A, v, gv)
     return inner_chunk_contribution
@@ -92,8 +102,8 @@ if __name__ == "__main__":
     gk = torch.randn(B, H, L, D_QK, device='cuda').to(dtype) 
     gv = torch.randn(B, H, L, D_V, device='cuda').to(dtype) 
 
-    gk = (F.logsigmoid(gk) / 16).requires_grad_(require_grad)
-    gv = (F.logsigmoid(gv) / 16).requires_grad_(require_grad)
+    gk = (F.logsigmoid(gk) / 16).cumsum(-2).requires_grad_(require_grad)
+    gv = (F.logsigmoid(gv) / 16).cumsum(-2).requires_grad_(require_grad)
 
     for _ in range(100):
         # o = naive(q, k, v, gk, gv, BLOCK_N = 64)
