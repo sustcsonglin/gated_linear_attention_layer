@@ -1,19 +1,23 @@
 #include <torch/extension.h>
+#include "ATen/ATen.h"
+#define MIN_VALUE (-1e38)
+typedef at::BFloat16 bf16;
 
 void run_fwd_o_chunk16_dim64x(int batchSize, int M, int N_K, int N_V,
-                                float *Q, float *K, float *V, 
+                                bf16 *Q, bf16 *K, bf16 *V, 
                                 float *gK, float *gV,
                                 float *QK,
-                                float *O);
+                                bf16 *O);
 
 void run_bwd_o_chunk16_dim64x(int batchSize, int M, int N_K, int N_V,  
-                                float *Q, float *K, float *V,
+                                bf16 *Q, bf16 *K, bf16 *V,
                                 float *gK, float *gV, float *QK,
-                                
-                                float *DO,
-                                float *DQ, float *DK, float *DV,
-                                float *DgK, float *DgV, 
-                                );                   
+                                bf16 *DO,
+                                bf16 *DQ, bf16 *DK, bf16 *DV,
+                                float *DgK, float *DgV);                   
+
+
+
 
 
 std::vector<torch::Tensor> fwd(torch::Tensor Q,
@@ -21,7 +25,9 @@ torch::Tensor K, torch::Tensor V,
 torch::Tensor g_K, torch::Tensor g_V
 ) {   
     auto O = torch::empty_like(V);
-    auto QK = torch::empty({Q.size(0), Q.size(1), Q.size(2), Q.size(3), Q.size(3)}, Q.options());    
+    
+    // fp32
+    auto QK = torch::empty({Q.size(0), Q.size(1), Q.size(2), Q.size(3), Q.size(3)}, g_V.options());    
 
     int B_size = Q.size(0); // This is the batch size dimension.
     int H_size = Q.size(1); // This is the head dimension
@@ -31,8 +37,8 @@ torch::Tensor g_K, torch::Tensor g_V
     int N_V = V.size(-1); // this is the head_V dim
     
     run_fwd_o_chunk16_dim64x(B_size * H_size * num_chunk, M, N_K, N_V, 
-      Q.data_ptr<float>(), K.data_ptr<float>(),  V.data_ptr<float>(), 
-      g_K.data_ptr<float>(), g_V.data_ptr<float>(), QK.data_ptr<float>(), O.data_ptr<float>());
+      Q.data_ptr<bf16>(), K.data_ptr<bf16>(),  V.data_ptr<bf16>(), 
+      g_K.data_ptr<float>(), g_V.data_ptr<float>(), QK.data_ptr<float>(), O.data_ptr<bf16>());
       
     return {O, QK};
 }
@@ -61,22 +67,22 @@ torch::Tensor g_K, torch::Tensor g_V, torch::Tensor QK, torch::Tensor DO
 
 
     run_bwd_o_chunk16_dim64x(B_size * H_size * num_chunk, M, N_K, N_V,   
-                        Q.data_ptr<float>(),
-                        K.data_ptr<float>(), 
-                        V.data_ptr<float>(),
+                        Q.data_ptr<bf16>(),
+                        K.data_ptr<bf16>(), 
+                        V.data_ptr<bf16>(),
                         g_K.data_ptr<float>(),
                         g_V.data_ptr<float>(), 
                         QK.data_ptr<float>(),
-                        DO.data_ptr<float>(),
-                        DQ.data_ptr<float>(), 
-                        DK.data_ptr<float>(),
-                        DV.data_ptr<float>(),
+                        DO.data_ptr<bf16>(),
+                        DQ.data_ptr<bf16>(), 
+                        DK.data_ptr<bf16>(),
+                        DV.data_ptr<bf16>(),
                         Dg_K.data_ptr<float>(),
-                        Dg_V.data_ptr<float>()
-                        );                
+                        Dg_V.data_ptr<float>());                
     return {DQ, DK, DV, Dg_K, Dg_V};
 
 }
+
 
 
 

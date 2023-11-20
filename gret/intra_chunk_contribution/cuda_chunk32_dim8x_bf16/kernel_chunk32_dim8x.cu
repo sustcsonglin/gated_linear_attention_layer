@@ -1,14 +1,17 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
+#include "ATen/ATen.h"
+#define MIN_VALUE (-1e38)
+typedef at::BFloat16 bf16;
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 #define FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 
 __global__ void fwd_o_chunk16_dim64x(int batchSize, int M, int N_K, int N_V,
-                                     float *Q, float *K, float *V, float *G_K, float *G_V,
+                                     bf16 *Q, bf16 *K, bf16 *V, float *G_K, float *G_V,
                                      float *QK,
-                                     float *O
+                                     bf16 *O
                                     ) {
 
   // Batch index
@@ -41,8 +44,8 @@ __global__ void fwd_o_chunk16_dim64x(int batchSize, int M, int N_K, int N_V,
   // for loading. we can load 256 element in one time. so, 8 of N_K can be loaded in one time.
   // each thread will compute 8 sum for 4 element they are responsible for.
   for (int bkIdx = 0; bkIdx < N_K; bkIdx += 8) {    
-    Q_tile[threadRow][threadCol] = Q[threadRow * N_K + threadCol];                
-    K_tile[threadRow][threadCol] = K[threadRow * N_K + threadCol];
+    Q_tile[threadRow][threadCol] = (float)(Q[threadRow * N_K + threadCol]);                
+    K_tile[threadRow][threadCol] = (float)(K[threadRow * N_K + threadCol]);
     float tmp_gk = G_K[threadRow * N_K + threadCol];
     G_tile[threadRow][threadCol] = tmp_gk;
     G_tile_trans[threadCol][threadRow] = tmp_gk;
@@ -80,7 +83,7 @@ __global__ void fwd_o_chunk16_dim64x(int batchSize, int M, int N_K, int N_V,
   __syncthreads();
   
   for(int gg =0; gg < N_V; gg+=8){
-        V_tile[B_row][B_column] = V[B_row * N_V + B_column];
+        V_tile[B_row][B_column] = float(V[B_row * N_V + B_column]);
         G_tile[B_row][B_column] = G_V[B_row * N_V + B_column];
         __syncthreads();
 
@@ -105,11 +108,11 @@ __global__ void fwd_o_chunk16_dim64x(int batchSize, int M, int N_K, int N_V,
 
 
 __global__ void compute_d_kernel(int batchSize, int M, int N_K, int N_V,
-                                 float *Q, float *K, float *V, float *GK, float *GV,
+                                 bf16 *Q, bf16 *K, bf16 *V, float *GK, float *GV,
                                  float *QK,
                                     
-                                 float *DO,
-                                 float *DQ, float *DK, float *DV, float *DG_K, float *DG_V                                  
+                                 bf16 *DO,
+                                 bf16 *DQ, bf16 *DK, bf16 *DV, float *DG_K, float *DG_V                                  
                                 ) {
     
     const uint batchIdx = blockIdx.x;
@@ -158,9 +161,9 @@ __global__ void compute_d_kernel(int batchSize, int M, int N_K, int N_V,
         // float threadResults_dV[4] = {0.0};
         // float threadResults_dgv[4] = {0.0};        
         
-        V_tile[B_row][B_column] = V[B_row * N_V + B_column];
+        V_tile[B_row][B_column] = float(V[B_row * N_V + B_column]);
         GV_tile[B_row][B_column] = GV[B_row * N_V + B_column];
-        DO_tile[B_row][B_column] = DO[B_row * N_V + B_column];
+        DO_tile[B_row][B_column] = float(DO[B_row * N_V + B_column]);
         __syncthreads();
 
         float threadResults_dV = 0;
@@ -190,7 +193,7 @@ __global__ void compute_d_kernel(int batchSize, int M, int N_K, int N_V,
             }
             }
         }
-        DV[B_row * N_V + B_column] = threadResults_dV;        
+        DV[B_row * N_V + B_column] = bf16(threadResults_dV);        
         DG_V[B_row * N_V + B_column] = threadResults_dgv;
         DV += 8;
         DG_V += 8;
@@ -218,8 +221,8 @@ __global__ void compute_d_kernel(int batchSize, int M, int N_K, int N_V,
         float threadResults_dgk = 0.0;        
 
         GK_tile[B_row][B_column] = GK[B_row * N_K + B_column];
-        Q_tile[B_row][B_column] = Q[B_row * N_K + B_column];
-        K_tile[B_row][B_column] = K[B_row * N_K + B_column];
+        Q_tile[B_row][B_column] = float(Q[B_row * N_K + B_column]);
+        K_tile[B_row][B_column] = float(K[B_row * N_K + B_column]);
          
         __syncthreads();
 
@@ -239,8 +242,8 @@ __global__ void compute_d_kernel(int batchSize, int M, int N_K, int N_V,
             }
         }
 
-        DQ[B_row * N_K + B_column] = threadResults_dQ;                
-        DK[B_row * N_K + B_column] = threadResults_dK;  
+        DQ[B_row * N_K + B_column] = bf16(threadResults_dQ);                
+        DK[B_row * N_K + B_column] = bf16(threadResults_dK);  
         DG_K[B_row * N_K + B_column] = threadResults_dgk;
         DQ += 8;
         DK += 8;
@@ -254,10 +257,10 @@ __global__ void compute_d_kernel(int batchSize, int M, int N_K, int N_V,
 }
 
 void run_fwd_o_chunk16_dim64x(int batchSize, int M, int N_K, int N_V,
-                                float *Q, float *K, float *V, 
+                                bf16 *Q, bf16 *K, bf16 *V, 
                                 float *gK, float *gV,
                                 float *QK,
-                                float *O) {  
+                                bf16 *O) {  
   dim3 gridDim(batchSize); 
   dim3 blockDim(256);
   fwd_o_chunk16_dim64x<<<gridDim, blockDim>>>(batchSize, M, N_K, N_V, Q, K, V, gK, gV, QK, O); 
@@ -266,12 +269,11 @@ void run_fwd_o_chunk16_dim64x(int batchSize, int M, int N_K, int N_V,
 
 
 
-
 void run_bwd_o_chunk16_dim64x(int batchSize, int M, int N_K, int N_V,  
-                                float *Q, float *K, float *V,
+                                bf16 *Q, bf16 *K, bf16 *V,
                                 float *gK, float *gV, float *QK,
-                                float *DO, 
-                                float *DQ, float *DK, float *DV,
+                                bf16 *DO, 
+                                bf16 *DQ, bf16 *DK, bf16 *DV,
                                 float *DgK, float *DgV
                                 ) {
     dim3 gridDim(batchSize); 
