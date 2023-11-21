@@ -19,7 +19,7 @@ def stable_log_sigmoid(x):
 def _fwd_preprocess_cumsum_gk(
     Q, K, GK, GK_cumsum, 
     Q_exp, K_reduce, GK_last_exp, 
-    NUM_CHUNK, L, normalizer,
+    NUM_CHUNK, L, normalizer, clam_min, 
     D_MODEL_K: tl.constexpr, 
     CHUNK_SIZE: tl.constexpr, 
   ):
@@ -40,6 +40,7 @@ def _fwd_preprocess_cumsum_gk(
     for _ in range(CHUNK_SIZE):
         gk = tl.load(GK_ptr).to(tl.float32) 
         gk = stable_log_sigmoid(gk) / normalizer
+        gk = tl.where(gk >= clam_min, gk, clam_min)
 
         cumsum += gk 
         tl.store(GK_cumsum_ptr, cumsum.to(GK_cumsum_ptr.dtype.element_ty))
@@ -159,10 +160,7 @@ def _bwd_preprocess_cumsum_gk(
 
     # tl.store(D_GK_last_exp_ptr, cumsum_gradient)
 
-
-    ## feel like i can do this without loop.
-    # avoid strange bug....
-
+    # seems stupid. just workaround some unknown bugs.
     grad_gk_last = grad_gk_last + 0.
     for idx in range(CHUNK_SIZE -1, -1, -1):        
         dgk = tl.load(DGK_ptr).to(tl.float32)
@@ -175,14 +173,6 @@ def _bwd_preprocess_cumsum_gk(
         DGK_ptr -= D_MODEL_K
         GK_ptr -= D_MODEL_K
     
-
-
-    
-
-
-
-
-
 
 
 @triton.jit
@@ -334,6 +324,7 @@ class PreprocessCumSum(torch.autograd.Function):
         gk = gk.contiguous()
         gv = gv.contiguous()
         
+        
         B, H, NUM_CHUNK, CHUNK_SIZE, D = q.shape
 
         D_k = k.shape[-1]
@@ -363,7 +354,7 @@ class PreprocessCumSum(torch.autograd.Function):
         _fwd_preprocess_cumsum_gk[grid](
             q, k, gk, gk_cumsum, 
             q_exp, k_reduce, gk_last_exp, 
-            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=8,
+            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=normalizer_gk,
             D_MODEL_K=D_k, num_warps=8 if D_k >= 512 else 4
         )
 
@@ -375,12 +366,14 @@ class PreprocessCumSum(torch.autograd.Function):
         _fwd_preprocess_cumsum_gv[grid](
             v, gv,  gv_cumsum, gv_cumsum_exp,  
             v_reduce, gv_last_exp, 
-            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=8,
+            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=normalizer_gv,
             D_MODEL_V=D_v, num_warps=8 if D_v >= 512 else 4
         )
 
         ctx.grid = grid 
         ctx.save_for_backward(q, k, v, gk, gv, gk_cumsum, gv_cumsum)
+        ctx.normalizer_gk = normalizer_gk
+        ctx.normalizer_gv = normalizer_gv
 
         return gk_cumsum, gv_cumsum, k_reduce, v_reduce, q_exp, gv_cumsum_exp, gk_last_exp, gv_last_exp
 
@@ -413,20 +406,18 @@ class PreprocessCumSum(torch.autograd.Function):
             q, k, gk, gk_cumsum, 
             dq_exp, dk_reduce, dgk_last_exp, dgk_cumsum,
             dq, dk, dgk,
-            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=8,
+            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=ctx.normalizer_gk,
             D_MODEL_K=D_k, num_warps=8 if D_k >= 512 else 4
         )
 
         dv = torch.empty_like(v)
-        dgv = torch.empty_like(gv, dtype=torch.float32)
-        
+        dgv = torch.empty_like(gv, dtype=torch.float32)        
         _bwd_preprocess_cumsum_gv[grid](
             v, gv, gv_cumsum,  dgv_cumsum_exp, dv_reduce, dgv_last_exp, dgv_cumsum, 
             dv, dgv, 
-            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=8,
+            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=ctx.normalizer_gv,
             D_MODEL_V=D_v, num_warps=8 if D_k >= 512 else 4 
-        )
-        
+        )    
         return dq, dk, dv, dgk, dgv, None, None
     
 
@@ -473,13 +464,15 @@ if __name__ == "__main__":
     num_chunk = L // chunk_size
     device = "cuda"
     requires_grad = True
-    dtype = torch.bfloat16
+    dtype = torch.float32
     
+
     v1 = (torch.randn(B, H, num_chunk, chunk_size, D_K)).cuda().to(dtype).requires_grad_(requires_grad)
     v2 = (torch.randn(B, H, num_chunk, chunk_size, D_V)).cuda().to(dtype).requires_grad_(requires_grad) 
-    g1 = torch.randn(B, H,  num_chunk, chunk_size, D_K).cuda().to(dtype).uniform_(0.95, 0.99).log().requires_grad_(requires_grad)
-    g2 = torch.randn(B, H, num_chunk, chunk_size, D_V).cuda().to(dtype).uniform_(0.95, 0.99).log().requires_grad_(requires_grad)
+    g1 = torch.randn(B, H,  num_chunk, chunk_size, D_K).cuda().to(dtype).uniform_(0.5, 0.99).log().requires_grad_(requires_grad)
+    g2 = torch.randn(B, H, num_chunk, chunk_size, D_V).cuda().to(dtype).uniform_(0.5, 0.99).log().requires_grad_(requires_grad)
     q = (torch.randn(B, H, num_chunk, chunk_size, D_K)).cuda().to(dtype).requires_grad_(requires_grad) 
+
 
     test_speed= True 
     test_gradient = True

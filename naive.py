@@ -14,8 +14,10 @@ def naive_fwd(v1, v2, g1, g2, q):
         O[:, i] = output
 
     return O
-    
-# parallel
+
+
+       
+
 def naive_fwd_v2(v1, v2, g1, g2, q):    
     B, L, D = v1.shape
 
@@ -37,24 +39,25 @@ def naive_fwd_v2(v1, v2, g1, g2, q):
 
 
 
-
-
-
 if __name__ == "__main__":
     B = 4
-    L = 4
+    L = 1024
     D = 16
     
-    v1 = torch.randn(B, L, D).cuda().requires_grad_(True)
-    v2 = torch.randn(B, L, D).cuda().requires_grad_(True)
+
+    v1 = torch.randn(B, L, D).cuda().exp().requires_grad_(True)
+    v2 = torch.randn(B, L, D).cuda().exp().requires_grad_(True)
     g1 = torch.randn(B, L, D).cuda().sigmoid().requires_grad_(True)
-    g2 = torch.randn(B, L, D).cuda().sigmoid().requires_grad_(True)
+    g2 = torch.ones(B, L, D).cuda().requires_grad_(True)
 
     q = torch.randn(B, L, D).cuda().requires_grad_(True)
     output1 = naive_fwd(v1, v2, g1, g2, q)
     output2 = naive_fwd_v2(v1, v2, g1, g2, q)
     breakpoint()
+
+
     
+
     
 
 
