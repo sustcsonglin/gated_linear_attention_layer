@@ -10,19 +10,22 @@ import time
 #     neg_abs_x = -torch.abs(x)
 #     return torch.where(x < 0, x, neg_abs_x) - torch.log1p(torch.exp(neg_abs_x))
 
+
 @triton.jit 
 def stable_log_sigmoid(x):
-    neg_abs_x = -tl.where(x>0, x, -x)
-    return tl.where(x < 0, x, neg_abs_x) - tl.log(1 + tl.exp(neg_abs_x))
+    max_value = tl.where(x<0, x, 0)
+    return -max_value - tl.log(tl.exp(-max_value) + tl.exp(-x - max_value))
+    
 
 @triton.jit
 def _fwd_preprocess_cumsum_gk(
     Q, K, GK, GK_cumsum, 
     Q_exp, K_reduce, GK_last_exp, 
-    NUM_CHUNK, L, normalizer, clam_min, 
+    NUM_CHUNK, L, normalizer, clamp_min, 
     D_MODEL_K: tl.constexpr, 
     CHUNK_SIZE: tl.constexpr, 
   ):
+
 
     offset_bh = tl.program_id(0)
     offset_c = tl.program_id(1)
@@ -40,7 +43,7 @@ def _fwd_preprocess_cumsum_gk(
     for _ in range(CHUNK_SIZE):
         gk = tl.load(GK_ptr).to(tl.float32) 
         gk = stable_log_sigmoid(gk) / normalizer
-        gk = tl.where(gk >= clam_min, gk, clam_min)
+        gk = tl.where(gk >= clamp_min, gk, clamp_min)
 
         cumsum += gk 
         tl.store(GK_cumsum_ptr, cumsum.to(GK_cumsum_ptr.dtype.element_ty))
@@ -85,7 +88,7 @@ def _bwd_preprocess_cumsum_gk(
 
     DQ, DK, DGK, 
 
-    NUM_CHUNK, L, normalizer,
+    NUM_CHUNK, L, normalizer, clamp_min, 
     D_MODEL_K: tl.constexpr, 
     CHUNK_SIZE: tl.constexpr, 
   ):
@@ -160,26 +163,26 @@ def _bwd_preprocess_cumsum_gk(
 
     # tl.store(D_GK_last_exp_ptr, cumsum_gradient)
 
-    # seems stupid. just workaround some unknown bugs.
+    # seems stupid. just workaround some compiler bugs.
     grad_gk_last = grad_gk_last + 0.
     for idx in range(CHUNK_SIZE -1, -1, -1):        
         dgk = tl.load(DGK_ptr).to(tl.float32)
         dgk += grad_gk_last
-        
+    
         gk = tl.load(GK_ptr).to(tl.float32) 
-        gk = tl.sigmoid(gk)    
-        dgk = (dgk / normalizer) * (1 - gk)
+        gk_logit = stable_log_sigmoid(gk) / normalizer
+        dgk = tl.where(gk_logit >= clamp_min, (dgk / normalizer)  * (1 - tl.sigmoid(gk)), 0.)
+
         tl.store(DGK_ptr, dgk.to(DGK_ptr.dtype.element_ty))
         DGK_ptr -= D_MODEL_K
         GK_ptr -= D_MODEL_K
     
 
-
 @triton.jit
 def _fwd_preprocess_cumsum_gv(
     V, GV,  
     GV_cumsum, GV_exp, V_reduce, GV_last_exp, 
-    NUM_CHUNK, L, normalizer,
+    NUM_CHUNK, L, normalizer, clamp_min,
     D_MODEL_V: tl.constexpr, 
     CHUNK_SIZE: tl.constexpr, 
   ):
@@ -201,7 +204,10 @@ def _fwd_preprocess_cumsum_gv(
         # gv = tl.sigmoid(gv)
         # gv = tl.log(gv + 1e-9) / normalizer
         gv = stable_log_sigmoid(gv) / normalizer
+        gv = tl.where(gv >= clamp_min, gv, clamp_min)
         cumsum += gv
+
+
 
         tl.store(GV_cumsum_ptr, cumsum.to(GV_cumsum_ptr.dtype.element_ty))
         tl.store(GV_exp_ptr, tl.math.exp(cumsum).to(GV_cumsum_ptr.dtype.element_ty))
@@ -235,10 +241,11 @@ def _bwd_preprocess_cumsum_gv(
     DGV_cumsum_exp, DV_reduce, DGV_last_exp, DGV_cumsum, 
     DV, DGV, 
 
-    NUM_CHUNK, L, normalizer,
+    NUM_CHUNK, L, normalizer, clamp_min, 
     D_MODEL_V: tl.constexpr, 
     CHUNK_SIZE: tl.constexpr, 
   ):
+
 
     offset_bh = tl.program_id(0)
     offset_c = tl.program_id(1)
@@ -307,8 +314,12 @@ def _bwd_preprocess_cumsum_gv(
         dgv = tl.load(DGV_ptr).to(tl.float32)
         dgv += grad_gv_last
         gv = tl.load(GV_ptr).to(tl.float32) 
+
+        gv_logit = stable_log_sigmoid(gv) / normalizer
         gv = tl.sigmoid(gv)    
-        dgv = (dgv / normalizer) * (1 - gv)
+        dgv = (dgv / normalizer) * (1 - gv)        
+        dgv = tl.where(gv_logit >= clamp_min, dgv, 0.)
+
         tl.store(DGV_ptr, dgv.to(DGV_ptr.dtype.element_ty))
         DGV_ptr -= D_MODEL_V
         GV_ptr -= D_MODEL_V
@@ -317,7 +328,7 @@ def _bwd_preprocess_cumsum_gv(
 
 class PreprocessCumSum(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, gk, gv, normalizer_gk=8, normalizer_gv=8):
+    def forward(ctx, q, k, v, gk, gv, normalizer_gk=8, normalizer_gv=8, clamp_min=-3):
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
@@ -354,7 +365,7 @@ class PreprocessCumSum(torch.autograd.Function):
         _fwd_preprocess_cumsum_gk[grid](
             q, k, gk, gk_cumsum, 
             q_exp, k_reduce, gk_last_exp, 
-            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=normalizer_gk,
+            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=normalizer_gk, clamp_min=clamp_min,
             D_MODEL_K=D_k, num_warps=8 if D_k >= 512 else 4
         )
 
@@ -366,7 +377,7 @@ class PreprocessCumSum(torch.autograd.Function):
         _fwd_preprocess_cumsum_gv[grid](
             v, gv,  gv_cumsum, gv_cumsum_exp,  
             v_reduce, gv_last_exp, 
-            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=normalizer_gv,
+            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=normalizer_gv, clamp_min=clamp_min,
             D_MODEL_V=D_v, num_warps=8 if D_v >= 512 else 4
         )
 
@@ -374,6 +385,7 @@ class PreprocessCumSum(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, gk, gv, gk_cumsum, gv_cumsum)
         ctx.normalizer_gk = normalizer_gk
         ctx.normalizer_gv = normalizer_gv
+        ctx.clamp_min = clamp_min
 
         return gk_cumsum, gv_cumsum, k_reduce, v_reduce, q_exp, gv_cumsum_exp, gk_last_exp, gv_last_exp
 
@@ -406,7 +418,7 @@ class PreprocessCumSum(torch.autograd.Function):
             q, k, gk, gk_cumsum, 
             dq_exp, dk_reduce, dgk_last_exp, dgk_cumsum,
             dq, dk, dgk,
-            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=ctx.normalizer_gk,
+            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=ctx.normalizer_gk, clamp_min = ctx.clamp_min,
             D_MODEL_K=D_k, num_warps=8 if D_k >= 512 else 4
         )
 
@@ -415,21 +427,21 @@ class PreprocessCumSum(torch.autograd.Function):
         _bwd_preprocess_cumsum_gv[grid](
             v, gv, gv_cumsum,  dgv_cumsum_exp, dv_reduce, dgv_last_exp, dgv_cumsum, 
             dv, dgv, 
-            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=ctx.normalizer_gv,
+            CHUNK_SIZE=CHUNK_SIZE, NUM_CHUNK = NUM_CHUNK, L = CHUNK_SIZE * NUM_CHUNK, normalizer=ctx.normalizer_gv, clamp_min = ctx.clamp_min,
             D_MODEL_V=D_v, num_warps=8 if D_k >= 512 else 4 
         )    
-        return dq, dk, dv, dgk, dgv, None, None
+        return dq, dk, dv, dgk, dgv, None, None, None
     
 
-
-def prepare_cumsum(query, key, value, g_key, g_value):
+def prepare_cumsum(query, key, value, g_key, g_value, normalizer_gk=8, normalizer_gv=8, clamp_min=-3):
     g_key = g_key 
     g_value = g_value
-    g_key = F.logsigmoid(g_key) / 8
+
+    g_key = (F.logsigmoid(g_key) / normalizer_gk).clamp(min=clamp_min)
     g_key_cumsum = g_key.cumsum(-2)
     reduce_chunk_key = (g_key_cumsum[..., -1, None, :] -  g_key_cumsum).exp()
-
-    g_value = F.logsigmoid(g_value) / 8
+    
+    g_value = (F.logsigmoid(g_value) / normalizer_gv).clamp(min=clamp_min)
     g_value_cumsum = g_value.cumsum(-2)
     reduce_chunk_value = (g_value_cumsum[..., -1, None, :] - g_value_cumsum).exp()
     
@@ -460,7 +472,8 @@ if __name__ == "__main__":
     D_K = 256
     D_V = 512
     
-    chunk_size = 32
+
+    chunk_size = 16
     num_chunk = L // chunk_size
     device = "cuda"
     requires_grad = True
@@ -469,18 +482,20 @@ if __name__ == "__main__":
 
     v1 = (torch.randn(B, H, num_chunk, chunk_size, D_K)).cuda().to(dtype).requires_grad_(requires_grad)
     v2 = (torch.randn(B, H, num_chunk, chunk_size, D_V)).cuda().to(dtype).requires_grad_(requires_grad) 
-    g1 = torch.randn(B, H,  num_chunk, chunk_size, D_K).cuda().to(dtype).uniform_(0.5, 0.99).log().requires_grad_(requires_grad)
-    g2 = torch.randn(B, H, num_chunk, chunk_size, D_V).cuda().to(dtype).uniform_(0.5, 0.99).log().requires_grad_(requires_grad)
+    g1 = torch.randn(B, H,  num_chunk, chunk_size, D_K).cuda().to(dtype)
+    g1[..., :D_K//2] = -1
+    g1[..., D_K//2:] = 1
+    g1.requires_grad_(requires_grad)
+    g2 = torch.randn(B, H, num_chunk, chunk_size, D_V).cuda().to(dtype).uniform_(0.3, 0.7).log().requires_grad_(requires_grad)
     q = (torch.randn(B, H, num_chunk, chunk_size, D_K)).cuda().to(dtype).requires_grad_(requires_grad) 
 
-
-    test_speed= True 
+    test_speed= False 
     test_gradient = True
 
     if test_gradient:
         target = [v1, v2, g1, g2, q]
         grad1= [ ]
-        g_key_cumsum, g_value_cumsum,  reduce_key, reduce_value, q_exp, g_value_cumsum_exp, g_key_last_exp, g_value_last_exp = PreprocessCumSum.apply(q, v1, v2, g1, g2)
+        g_key_cumsum, g_value_cumsum,  reduce_key, reduce_value, q_exp, g_value_cumsum_exp, g_key_last_exp, g_value_last_exp = PreprocessCumSum.apply(q, v1, v2, g1, g2, 1, 1, -1)
         
         o = (g_key_cumsum ** 2).sum() + (g_value_cumsum ** 2).sum() + (reduce_key **2).sum() + (q_exp**2).sum() + (g_value_cumsum_exp **2).sum() + (g_key_last_exp**2).sum() + (g_value_last_exp **2).sum()
         o.sum().backward(retain_graph=True )
@@ -489,8 +504,9 @@ if __name__ == "__main__":
             grad1.append(v.grad.clone())
             v.grad.zero_()
         
-        g_key_cumsum, g_value_cumsum,  reduce_key, reduce_value, q_exp, g_value_cumsum_exp, g_key_last_exp, g_value_last_exp = prepare_cumsum(q, v1, v2, g1, g2)
-        o = (g_key_cumsum ** 2).sum() + (g_value_cumsum ** 2).sum() + (reduce_key **2).sum() + (q_exp**2).sum() + (g_value_cumsum_exp **2).sum() + (g_key_last_exp**2).sum() + (g_value_last_exp **2).sum()
+    
+        g_key_cumsum2, g_value_cumsum2,  reduce_key2, reduce_value2, q_exp2, g_value_cumsum_exp2, g_key_last_exp2, g_value_last_exp2 = prepare_cumsum(q, v1, v2, g1, g2, 1, 1, -1)
+        o = (g_key_cumsum2 ** 2).sum() + (g_value_cumsum2 ** 2).sum() + (reduce_key2 **2).sum() + (q_exp2**2).sum() + (g_value_cumsum_exp2 **2).sum() + (g_key_last_exp2**2).sum() + (g_value_last_exp2 **2).sum()
         o.sum().backward(retain_graph=True )
 
         grad2= [ ]
@@ -503,8 +519,9 @@ if __name__ == "__main__":
             print( (ss1 - ss2).abs().max())
     
             
-        
+        breakpoint()
   
+
         
     #### speed testing
     if test_speed:
