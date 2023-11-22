@@ -274,7 +274,7 @@ class FlashGRet(torch.autograd.Function):
         BLOCK_DMODEL_QK = min(Lk, 128)
         ctx.BLOCK_DMODEL_QK = BLOCK_DMODEL_QK
 
-        A = torch.zeros(Lk // 128, q.shape[0], q.shape[1], q.shape[2], BLOCK_N, BLOCK_N, device=q.device, dtype=q.dtype)        
+        A = torch.zeros(1 if Lk <= 128 else Lk//128, q.shape[0], q.shape[1], q.shape[2], BLOCK_N, BLOCK_N, device=q.device, dtype=q.dtype)        
         
         grid = (q.shape[2] , q.shape[0] * q.shape[1], 1 if Lk <= 128 else Lk//128)     
 

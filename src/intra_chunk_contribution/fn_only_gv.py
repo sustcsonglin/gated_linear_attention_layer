@@ -251,7 +251,7 @@ class FlashGRet_O(torch.autograd.Function):
         assert v.shape[-1] % BLOCK_V == 0
         v_exp = v.clone()
         
-        grid = (v.shape[2] , v.shape[0] * v.shape[1],   v.shape[-1] // BLOCK_V)
+        grid = (v.shape[2] , v.shape[0] * v.shape[1],  max(1, v.shape[-1] // BLOCK_V))
         o = torch.empty_like(v)            
 
         _fwd_compute_O[grid](A, v_exp, gv, o,

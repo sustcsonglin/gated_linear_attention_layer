@@ -10,13 +10,13 @@ import time
 #     neg_abs_x = -torch.abs(x)
 #     return torch.where(x < 0, x, neg_abs_x) - torch.log1p(torch.exp(neg_abs_x))
 
-
 @triton.jit 
 def stable_log_sigmoid(x):
+    # return     
     max_value = tl.where(x<0, x, 0)
-    return -max_value - tl.log(tl.exp(-max_value) + tl.exp(-x - max_value))
+    abs_value = tl.where(x>0, x, -x)
+    return max_value - tl.log(1 + tl.exp(-abs_value))
     
-
 @triton.jit
 def _fwd_preprocess_cumsum_gk(
     Q, K, GK, GK_cumsum, 
@@ -370,7 +370,8 @@ class PreprocessCumSum(torch.autograd.Function):
         )
 
         gv_cumsum = torch.empty_like(gv, dtype=torch.float32)                        
-        gv_cumsum_exp = torch.empty_like(gv_cumsum, dtype=torch.float32)
+        ### for possibly bf16 matmul.
+        gv_cumsum_exp = torch.empty_like(gv)
         v_reduce = torch.empty_like(v)
         gv_last_exp = torch.empty_like(gv[:, :, :, 0], dtype=torch.float32)
         
