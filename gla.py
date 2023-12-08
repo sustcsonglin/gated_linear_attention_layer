@@ -7,23 +7,23 @@ from src.intra_chunk_contribution.fn import intra_chunk_onc
 from src.inter_chunk_contribution.fn import inter_chunk_onc
 from time_counter import TimeCounter
 
-
-def gated_linear_attention(q, k, v, gk, gv, normalizer_gk=16, normalizer_gv=16,  num_head=8, chunk_size=256):
+## if you don't want to use gate in the K dimension, gk should be None
+## if you don't want to use gate in the V dimension, gv should be None
+def gated_linear_attention(q, k, v, gk, gv, normalizer_gk=16, normalizer_gv=16, clamp_min=-2, num_head=8, chunk_size=256):
     # assert q.dtype == k.dtype == v.dtype == torch.bfloat16
     assert gk.dtype == gv.dtype == torch.float32
     q = rearrange(q, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
     k = rearrange(k, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
     v = rearrange(v, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
-    gk = rearrange(gk, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
-    gv = rearrange(gv, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+    if gk is not None:
+        gk = rearrange(gk, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+    if gv is not None:
+        gv = rearrange(gv, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
     
-    with TimeCounter.profile_time("p1"):
-        gk, gv, o1 = inter_chunk_onc(q, k, v, gk, gv, normalizer_gk, normalizer_gv)
-    with TimeCounter.profile_time("p2"):
-        o2 = intra_chunk_onc(q, k, v, gk, gv)
+    gk, gv, o1 = inter_chunk_onc(q, k, v, gk, gv, normalizer_gk, normalizer_gv, clam_min)
+    o2 = intra_chunk_onc(q, k, v, gk, gv)
     o = (o1 + o2)
     return rearrange(o, 'b h n c d -> b (n c) (h d)')
-
 
 
 if __name__ == "__main__":

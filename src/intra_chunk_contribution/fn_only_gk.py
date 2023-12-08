@@ -13,6 +13,7 @@ import triton.language as tl
 import numpy as np
 import math
 
+
 @triton.jit
 def _fwd_kernel_compute_A(
     Q, K, GK, 

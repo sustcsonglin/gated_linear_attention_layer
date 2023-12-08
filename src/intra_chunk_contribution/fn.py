@@ -14,13 +14,14 @@ import math
 from .fn_only_gk import FlashGRet
 from .fn_only_gv import FlashGRet_O
 
-
 def intra_chunk_onc(q, k, v, gk, gv):
     assert q.is_contiguous()
     assert k.is_contiguous()
     assert v.is_contiguous()
-    assert gk.is_contiguous()
-    assert gv.is_contiguous()
+    if gk is not None:
+        assert gk.is_contiguous()
+    if gv is not None:
+        assert gv.is_contiguous()
 
     # q = q.float()
     # k = k.float()
@@ -29,18 +30,20 @@ def intra_chunk_onc(q, k, v, gk, gv):
     origin_chunk_size = k.shape[-2]
     assert k.shape[-2] % 16 == 0
     
-    A = FlashGRet.apply(q, k, gk)
+    if gk is not None:
+        A = FlashGRet.apply(q, k, gk)
+    else:
+        A = q @ k.transpose(-1, -2)
+
     mask = torch.triu(torch.ones(A.shape[-2], A.shape[-2]), diagonal=1).bool().to(A.device)
-    O = FlashGRet_O.apply(A, v, gv)
-    # return O 
+    A.masked_fill_(mask, 0)
+
+    if gv is not None:
+        O = FlashGRet_O.apply(A, v, gv)
+    else:
+        O = A.to(v) @ v         
+
     return O
-
-
-
-
-
-
-    
 
 
     
@@ -74,20 +77,21 @@ if __name__ == "__main__":
     H = 2
     L = 2048
     D_QK = 512
-    D_V = 512
+    D_V = 128
     requires_grad = True  
-    chunk_size = 32
+    chunk_size = 64
     num_chunk = L // chunk_size
 
-    dtype = torch.bfloat16
-    q = ((torch.randn(B, H, num_chunk, chunk_size, D_QK, device='cuda')/ (10)).to(dtype)).requires_grad_(requires_grad)  
-    k = (torch.randn(B, H, num_chunk, chunk_size, D_QK, device='cuda')/10).to(dtype).requires_grad_(requires_grad)
+    dtype = torch.float32
+    q = ((torch.randn(B, H, num_chunk, chunk_size, D_QK, device='cuda') / 10).to(dtype)).requires_grad_(requires_grad)  
+    k = (torch.randn(B, H, num_chunk, chunk_size, D_QK, device='cuda') / 10).to(dtype).requires_grad_(requires_grad)
     v = torch.randn(B, H, num_chunk, chunk_size, D_V, device='cuda').to(dtype).requires_grad_(requires_grad)
     gk = torch.randn(B, H, num_chunk, chunk_size, D_QK, device='cuda')
     gv =  torch.randn(B, H, num_chunk, chunk_size, D_V, device='cuda')
+    
 
-    gk = F.logsigmoid(gk) / 64
-    gv = F.logsigmoid(gv) / 64
+    gk = F.logsigmoid(gk) / 32
+    gv = F.logsigmoid(gv) / 32
 
     gk = (gk.cumsum(-2)).requires_grad_(requires_grad)
     gv = (gv.cumsum(-2)).requires_grad_(requires_grad)
@@ -95,6 +99,7 @@ if __name__ == "__main__":
     # gk3 = gk3.clamp(min=-5)
     # gv3 = gv3.clamp(min=-5)     
      
+
     output = intra_chunk_onc(q, k, v, gk, gv)
 
     output.sum().backward(retain_graph=True)
