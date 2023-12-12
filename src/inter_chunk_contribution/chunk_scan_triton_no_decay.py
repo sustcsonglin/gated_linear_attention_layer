@@ -123,6 +123,7 @@ class Chunk_memory_update_no_decay(torch.autograd.Function):
         
         return output
 
+
     @staticmethod
     def backward(ctx, DO):
         DO = DO.contiguous()

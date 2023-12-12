@@ -106,9 +106,7 @@ def _bwd_kernel_dqk(Q, K, GK, DA,
 
     K_ptr = K + qk_offset + (start_m) * stride_q3 + tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4
 
-
     GK_K_ptr = GK + qk_offset + (start_m) * stride_q3 + tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4
-
 
     GK_Q_ptr = GK + qk_offset + (start_m) * stride_q3+ tl.arange(0, BLOCK_DMODEL_QK)[None, :] + tl.arange(0, 16)[:, None] * stride_q4
 
@@ -149,6 +147,8 @@ def _bwd_kernel_dqk(Q, K, GK, DA,
         tl.store(DGK_Q_ptr, dq_gk.to(DGK_Q_ptr.dtype.element_ty))
 
     tl.debug_barrier()
+
+
 
 
 
@@ -222,10 +222,6 @@ def _bwd_kernel_dqk(Q, K, GK, DA,
 
 
 
-
-
-
-
 def compute_inner(query, key, value, decay_key):
     # query = rearrange(query, 'b h (n c) d -> b h n c d', c=chunk_size)
     # key = rearrange(key, 'b h (n c) d -> b h n c d', c=chunk_size)
@@ -272,9 +268,10 @@ class FlashGRet(torch.autograd.Function):
         q = q.contiguous()
         k = k.contiguous()
         gk = gk.contiguous()
-        assert gk.dtype==torch.float32
         
+        # assert gk.dtype==torch.float32        
         # only support for Ampere now
+
         capability = torch.cuda.get_device_capability()
         if capability[0] < 8:
             raise RuntimeError("Flash attention currently only supported for compute capability >= 80")
@@ -292,12 +289,11 @@ class FlashGRet(torch.autograd.Function):
         BLOCK_DMODEL_QK = min(Lk, 128)
         ctx.BLOCK_DMODEL_QK = BLOCK_DMODEL_QK
 
-        A = torch.zeros(max(1, Lk//128) , q.shape[0], q.shape[1], q.shape[2], BLOCK_N, BLOCK_N, device=q.device, dtype=torch.float32)        
-        
-        grid = (q.shape[2] , q.shape[0] * q.shape[1], max(1, Lk//128))     
+        A = torch.zeros(max(1, Lk//128) , q.shape[0], q.shape[1], q.shape[2], BLOCK_N, BLOCK_N, device=q.device, dtype=q.dtype)                
 
-        # q_exp = q.clone()
-        # k_exp = k.clone()
+
+
+        grid = (q.shape[2] , q.shape[0] * q.shape[1], max(1, Lk//128))     
 
         # assert q.dtype == k.dtype == v.dtype                  
         _fwd_kernel_compute_A[grid](
@@ -314,7 +310,7 @@ class FlashGRet(torch.autograd.Function):
         ctx.BLOCK_N = BLOCK_N
         ctx.BLOCK_N = BLOCK_N
         ctx.head = q.shape[1]
-        return A.sum(0)
+        return A.sum(0).to(q.dtype)
 
 
 

@@ -11,6 +11,7 @@ import triton.language as tl
 import numpy as np
 import math
 
+
 from .fn_only_gk import FlashGRet
 from .fn_only_gv import FlashGRet_O
 
@@ -110,6 +111,7 @@ if __name__ == "__main__":
     for s in target:
         grad1.append(s.grad.clone())
         s.grad.zero_()
+    
     
     o2 = compute_inner(q, k, v, gk, gv)
     o2.sum().backward(retain_graph=True)

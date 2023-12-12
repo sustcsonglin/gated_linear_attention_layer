@@ -104,13 +104,13 @@ def _bwd_preprocess_cumsum_gv(
     grad_gv_last = tl.zeros([D_MODEL_V], dtype=tl.float32)
 
     gv_last = tl.load(GV_cumsum_ptr + (CHUNK_SIZE - 1) * D_MODEL_V)    
-    cumsum_gradient += tl.load(D_GV_last_exp_ptr) * tl.exp(gv_last)
+    cumsum_gradient += tl.load(D_GV_last_exp_ptr) * tl.exp(gv_last).to(tl.float32)
     
     GV_ptr += (CHUNK_SIZE - 1) * D_MODEL_V
     GV_cumsum_ptr += (CHUNK_SIZE - 1) * D_MODEL_V
 
     V_ptr += (CHUNK_SIZE - 1) * D_MODEL_V 
-    
+
     DV_reduce_ptr += (CHUNK_SIZE - 1) * D_MODEL_V
     DGV_cumsum_ptr += (CHUNK_SIZE - 1) * D_MODEL_V
     DGV_cumsum_exp_ptr += (CHUNK_SIZE - 1) * D_MODEL_V

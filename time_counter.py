@@ -3,6 +3,49 @@ import warnings
 from contextlib import contextmanager
 import torch
 
+import torch
+from einops import rearrange
+import triton 
+import triton.language as tl
+import torch.nn.functional as F
+from src.intra_chunk_contribution.fn import intra_chunk_onc
+from src.inter_chunk_contribution.fn import inter_chunk_onc
+
+
+## if you don't want to use gate in the K dimension, gk should be None
+## if you don't want to use gate in the V dimension, gv should be None
+def gated_linear_attention(q, k, v, gk, gv, normalizer_gk=16, normalizer_gv=16, clamp_min=-2, num_head=8, chunk_size=128):
+
+    # (batch, length, D_Model)
+    if len(q.shape) == 3:
+        q = rearrange(q, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        k = rearrange(k, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        v = rearrange(v, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        
+        if gk is not None:
+            gk = rearrange(gk, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        if gv is not None:
+            gv = rearrange(gv, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+
+    # (batch, num_head, length, d_head)
+    elif len(q.shape) == 4:
+        q = rearrange(q, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        k = rearrange(k, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        v = rearrange(v, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        
+        if gk is not None:
+            gk = rearrange(gk, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        if gv is not None:
+            gv = rearrange(gv, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+    
+    gk, gv, o1 = inter_chunk_onc(q, k, v, gk, gv, normalizer_gk, normalizer_gv, clamp_min)
+    o2 = intra_chunk_onc(q, k, v, gk, gv)
+
+    o = (o1 + o2)
+    # o = o1
+
+    return rearrange(o, 'b h n c d -> b (n c) (h d)')
+
 
 class TimeCounter:
     names = dict()
@@ -118,4 +161,70 @@ class TimeCounter:
                     f'[{func_name}]-{count} times per count: '
                     f'{times_per_count:.1f} ms',
                     flush=True)
+
+## if you don't want to use gate in the K dimension, gk should be None
+## if you don't want to use gate in the V dimension, gv should be None
+def gated_linear_attention(q, k, v, gk, gv, normalizer_gk=16, normalizer_gv=16, clamp_min=-2, num_head=8, chunk_size=128):
+
+    # (batch, length, D_Model)
+    if len(q.shape) == 3:
+        q = rearrange(q, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        k = rearrange(k, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        v = rearrange(v, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        
+        if gk is not None:
+            gk = rearrange(gk, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        if gv is not None:
+            gv = rearrange(gv, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
+
+    # (batch, num_head, length, d_head)
+    elif len(q.shape) == 4:
+        q = rearrange(q, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        k = rearrange(k, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        v = rearrange(v, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        
+        if gk is not None:
+            gk = rearrange(gk, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+        if gv is not None:
+            gv = rearrange(gv, 'b h (n c) d -> b h n c d', h = num_head, c = chunk_size).contiguous()
+    
+    with TimeCounter.profile_time("p1"):
+        gk, gv, o1 = inter_chunk_onc(q, k, v, gk, gv, normalizer_gk, normalizer_gv)
+    with TimeCounter.profile_time("p2"):
+        o2 = intra_chunk_onc(q, k, v, gk, gv)
+
+    # gk, gv, o1 = inter_chunk_onc(q, k, v, gk, gv, normalizer_gk, normalizer_gv, clamp_min)
+    # o2 = intra_chunk_onc(q, k, v, gk, gv)
+
+    o = (o1 + o2)
+
+    # o = o1
+
+    return rearrange(o, 'b h n c d -> b (n c) (h d)')
+
+
+if __name__ == "__main__":
+    BATCH, H, N_CTX, D_HEAD = 32, 8, 2048, 128
+    dtype = torch.bfloat16
+    device = "cuda"
+    import time     
+    qkv = torch.randn((BATCH, N_CTX, 3, H, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+    fn = lambda: flash_attn_func(qkv, causal=True)
+    BATCH, H, N_CTX, D_HEAD = 32, 4, 2048, 256
+    q = torch.randn((BATCH, H, N_CTX, D_HEAD//2), dtype=dtype, device="cuda", requires_grad=True)
+    k = torch.randn((BATCH, H, N_CTX, D_HEAD//2), dtype=dtype, device="cuda", requires_grad=True)        
+
+    gk = torch.randn((BATCH, H, N_CTX, D_HEAD//2), dtype=dtype, device="cuda", requires_grad=True)        
+
+    v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+
+    # gv = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+
+
+    fn2 = lambda: gated_linear_attention(q, k, v, gk, None, num_head=H, chunk_size=256)
+
+
+    for _ in range(1000):
+        fn2()
+
 

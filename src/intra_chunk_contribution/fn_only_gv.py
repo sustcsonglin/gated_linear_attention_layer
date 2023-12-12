@@ -213,13 +213,15 @@ def _bwd_kernel_dav(V, GV, A, O,
         dv = dv2 * k_gv
         prev_dv = tl.load(DV_ptr + q_high * stride_v4)
         tl.store(DV_ptr + q_high * stride_v4, (prev_dv + dv).to(DV.dtype.element_ty))
-            
+
+
+
+
         prev_gdv = tl.load(DGV_ptr + q_high * stride_v4)
         prev_gdv -= dv * v 
         tl.store(DGV_ptr + q_high * stride_v4, prev_gdv.to(DGV.dtype.element_ty))
 
 
-        
 class FlashGRet_O(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, v, gv, chunk_size=16):

@@ -113,7 +113,7 @@ def _bwd_preprocess_cumsum_gk(
     cumsum_gradient = tl.zeros([D_MODEL_K], dtype=tl.float32)
     grad_gk_last = tl.zeros([D_MODEL_K], dtype=tl.float32)
 
-    gk_last = tl.load(GK_cumsum_ptr + (CHUNK_SIZE - 1) * D_MODEL_K)    
+    gk_last = tl.load(GK_cumsum_ptr + (CHUNK_SIZE - 1) * D_MODEL_K).to(tl.float32)    
     cumsum_gradient += tl.load(D_GK_last_exp_ptr) * tl.exp(gk_last)
     
     GK_ptr += (CHUNK_SIZE - 1) * D_MODEL_K
@@ -207,7 +207,7 @@ class PreprocessCumSum_GK(torch.autograd.Function):
 
         q_exp = torch.empty_like(q)
 
-        gk_cumsum = torch.empty_like(gk, dtype=torch.float32)
+        gk_cumsum = torch.empty_like(gk)
 
         gk_last_exp = torch.empty_like(gk[:, :, :, 0], dtype=torch.float32)
 
