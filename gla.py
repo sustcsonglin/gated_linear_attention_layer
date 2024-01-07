@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from src.intra_chunk_contribution.fn import intra_chunk_onc
 from src.inter_chunk_contribution.fn import inter_chunk_onc
 import torch.nn as nn 
+from fla.ops.triton.gla.recurrent_fuse import fused_recurrent_gla
 
 # token mixing layer. ~4D^2. 
 class GatedLinearAttention(nn.Module):
@@ -104,20 +105,21 @@ class GatedLinearAttention(nn.Module):
 
 
     def gated_linear_attention(self, q, k, v, gk, gv, normalizer_gk=16, normalizer_gv=16,  num_head=8, chunk_size=128):
-        # assert q.dtype == k.dtype == v.dtype == torch.bfloat16
         q = rearrange(q, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
         k = rearrange(k, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
         v = rearrange(v, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
-
         if gk is not None:
             gk = rearrange(gk, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
-
         if gv is not None:
             gv = rearrange(gv, 'b (n c) (h d) -> b h n c d', h = num_head, c = chunk_size).contiguous()
 
-        gk, gv, o1 = inter_chunk_onc(q, k, v, gk, gv, normalizer_gk, normalizer_gv)        
-        o2 = intra_chunk_onc(q, k, v, gk, gv)
-        o = (o1 + o2)
+        if gk is not None and gv is None:
+            gk = F.logsigmoid(gk) / normalizer_gk
+            o = fused_recurrent_gla(q, k, v, gk)
+        else:
+            gk, gv, o1 = inter_chunk_onc(q, k, v, gk, gv, normalizer_gk, normalizer_gv)        
+            o2 = intra_chunk_onc(q, k, v, gk, gv)
+            o = (o1 + o2)
         return o
 
 if __name__ == "__main__":
